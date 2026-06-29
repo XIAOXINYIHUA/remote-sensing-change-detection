@@ -1,0 +1,24 @@
+# 影像缓存 & 输出（文件太大）
+data/
+output/
+
+# 边界文件
+*.geojson
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Streamlit
+.app_state.json
+
+# 系统
+.DS_Store
+Thumbs.db
+*.log
+run_out*.log
+
+# IDE
+.vscode/
+.idea/
