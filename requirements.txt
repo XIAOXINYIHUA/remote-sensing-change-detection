@@ -1,0 +1,23 @@
+# 遥感解译助手 v2 依赖
+# pip install -r requirements.txt
+
+# 核心
+numpy>=2.0
+rasterio>=1.3
+opencv-python>=4.8
+matplotlib>=3.7
+shapely>=2.0
+pyproj>=3.5
+pandas>=2.0
+
+# 数据源
+pystac-client>=0.7
+planetary-computer>=1.0
+
+# 前端
+streamlit>=1.28
+folium>=0.15
+streamlit-folium>=0.20
+
+# 可选: Shapefile导出
+fiona>=1.9
