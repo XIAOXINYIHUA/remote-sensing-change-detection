@@ -22,3 +22,14 @@ run_out*.log
 # IDE
 .vscode/
 .idea/
+
+# 运行时状态
+.classify_state.json
+.shared_state.json
+.ts_state.json
+.streamlit/
+
+# 开发截图
+tmp/
+DEV_CONTEXT.md
+V3_UPGRADE_PLAN.md

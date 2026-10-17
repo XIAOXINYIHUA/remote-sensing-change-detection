@@ -1,0 +1,23 @@
+{
+  "tasks": [
+    {
+      "id": "lingchuan_2024_2025",
+      "region": "灵川县",
+      "boundary": "lingchuan_boundary.geojson",
+      "year1": 2024,
+      "year2": 2025,
+      "month_start": 6,
+      "month_end": 10,
+      "data_source": "sentinel2",
+      "detection_mode": "multi",
+      "index_type": "NDVI",
+      "threshold": 0.15,
+      "sample_points": 500,
+      "formats": "geojson,csv",
+      "report": true
+    }
+  ],
+  "output_base": "output",
+  "parallel": false,
+  "max_workers": 2
+}

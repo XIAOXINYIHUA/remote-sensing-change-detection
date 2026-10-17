@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  remote-sensing-tool:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8501:8501"
+    volumes:
+      - ../data:/app/data
+      - ../output:/app/output
+      - ../batch:/app/batch
+      - ../models:/app/models
+    environment:
+      - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=200
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
