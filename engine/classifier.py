@@ -373,8 +373,8 @@ def uncertainty_sampling(pca_3d, gmm, n_samples=200):
         indices: (n, 2) array of (row, col) 最不确定像元的坐标
         uncertainties: (n,) 不确定度分数（越高越不确定）
     """
-    h, w, _ = pca_3d.shape
-    pca_flat = pca_3d.reshape(-1, 3)
+    h, w, n_dims = pca_3d.shape
+    pca_flat = pca_3d.reshape(-1, n_dims)
     probs = gmm.predict_proba(pca_flat)
 
     # 策略 1: 最大概率置信度（越低越不确定）
@@ -400,36 +400,29 @@ def sample_patches(bands, pca_3d, gmm, patch_size=32, n_patches=50):
         uncertainties: 每个斑块的平均不确定性
     """
     h, w = list(bands.values())[0].shape[:2]
-    _, uncertainties = uncertainty_sampling(pca_3d, gmm, n_samples=n_patches * 10)
+    # coords 是全图 (row, col)，已按不确定性降序排列；
+    # 候选数按斑块面积放大，高不确定区域集中时仍能凑够不重叠斑块
+    coords, uncertainties = uncertainty_sampling(
+        pca_3d, gmm, n_samples=min(n_patches * patch_size * patch_size, h * w))
 
-    # 把不确定性分数映射回网格
-    uncertainty_map = np.zeros((h, w), dtype=np.float32)
-    rows, cols = np.unravel_index(
-        np.argsort(-uncertainties.flatten())[:n_patches * 10],
-        (h, w),
-    )
-    uncertainty_map[rows, cols] = uncertainties[: len(rows)]
-
-    # 在不确定性高的区域采样不重叠斑块
+    # 在不确定性高的像元处采样不重叠斑块
     half = patch_size // 2
-    patches = []
+    patches, patch_unc = [], []
     used = np.zeros((h, w), dtype=bool)
 
-    # 按不确定性排序的像元
-    candidates = np.argsort(-uncertainty_map.flatten())
-    for idx in candidates:
-        r = idx // w
-        c = idx % w
+    for (r, c), u in zip(coords, uncertainties):
+        r, c = int(r), int(c)
         if r - half < 0 or r + half >= h or c - half < 0 or c + half >= w:
             continue
         if used[r - half : r + half + 1, c - half : c + half + 1].any():
             continue
         patches.append((r, c))
+        patch_unc.append(float(u))
         used[r - half : r + half + 1, c - half : c + half + 1] = True
         if len(patches) >= n_patches:
             break
 
-    return patches, [float(uncertainty_map[r, c]) for r, c in patches]
+    return patches, patch_unc
 
 
 # ============================================================================

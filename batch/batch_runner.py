@@ -19,11 +19,52 @@ import json
 import time
 import argparse
 import traceback
+from contextlib import contextmanager
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
+import config
 from engine.utils import log
+
+
+def _task_overrides(task, boundary_file):
+    """把任务字段映射为 config 属性覆盖值（未指定的沿用当前 config）。"""
+    return {
+        "REGION_NAME": task.get("region", config.REGION_NAME),
+        "BOUNDARY_FILE": boundary_file,
+        "YEAR1": task.get("year1", config.YEAR1),
+        "YEAR2": task.get("year2", config.YEAR2),
+        "MONTH_START": task.get("month_start", config.MONTH_START),
+        "MONTH_END": task.get("month_end", config.MONTH_END),
+        "DETECTION_MODE": task.get("detection_mode", config.DETECTION_MODE),
+        "INDEX_TYPE": task.get("index_type", config.INDEX_TYPE),
+        "DATA_SOURCE": task.get("data_source", config.DATA_SOURCE),
+        "CHANGE_THRESHOLD": task.get("threshold", config.CHANGE_THRESHOLD),
+        "SEVERE_THRESHOLD": task.get("severe_threshold", config.SEVERE_THRESHOLD),
+        "NUM_SAMPLE_POINTS": task.get("sample_points", config.NUM_SAMPLE_POINTS),
+        "OUTPUT_FORMATS": task.get("formats", config.OUTPUT_FORMATS),
+        "GENERATE_REPORT": task.get("report", config.GENERATE_REPORT),
+    }
+
+
+@contextmanager
+def _config_overrides(overrides):
+    """临时覆盖全局 config 属性，退出时（含异常）还原，任务之间互不污染。
+
+    模块对象不能 copy.copy（会抛 TypeError），所以只保存/还原被覆盖的属性。
+    """
+    saved = {k: getattr(config, k) for k in overrides if hasattr(config, k)}
+    try:
+        for k, v in overrides.items():
+            setattr(config, k, v)
+        yield
+    finally:
+        for k in overrides:
+            if k in saved:
+                setattr(config, k, saved[k])
+            else:
+                delattr(config, k)
 
 
 class BatchRunner:
@@ -121,41 +162,24 @@ class BatchRunner:
             try:
                 log(f"\n[{task_idx}/{total}] {task_id} (attempt {attempt + 1})")
 
-                # 每个任务创建一个独立配置对象
-                import copy, config as cfg
-                task_cfg = copy.copy(cfg)
-
-                task_cfg.REGION_NAME = task.get("region", cfg.REGION_NAME)
-                task_cfg.BOUNDARY_FILE = boundary_file
-                task_cfg.YEAR1 = task.get("year1", cfg.YEAR1)
-                task_cfg.YEAR2 = task.get("year2", cfg.YEAR2)
-                task_cfg.MONTH_START = task.get("month_start", cfg.MONTH_START)
-                task_cfg.MONTH_END = task.get("month_end", cfg.MONTH_END)
-                task_cfg.DETECTION_MODE = task.get("detection_mode", cfg.DETECTION_MODE)
-                task_cfg.INDEX_TYPE = task.get("index_type", getattr(cfg, 'INDEX_TYPE', 'NDVI'))
-                task_cfg.DATA_SOURCE = task.get("data_source", cfg.DATA_SOURCE)
-                task_cfg.CHANGE_THRESHOLD = task.get("threshold", cfg.CHANGE_THRESHOLD)
-                task_cfg.OUTPUT_FORMATS = task.get("formats", cfg.OUTPUT_FORMATS)
-                task_cfg.GENERATE_REPORT = task.get("report", cfg.GENERATE_REPORT)
-
-                # 暂时写入全局 config（兼容 run_pipeline_v3 读取方式）
-                import config
-                for attr in dir(task_cfg):
-                    if not attr.startswith("_"):
-                        setattr(config, attr, getattr(task_cfg, attr))
-
+                overrides = _task_overrides(task, boundary_file)
                 out_dir = os.path.join(
                     BASE_DIR, self.configs.get("output_base", "output"), task_id)
-                data_dir = os.path.join(BASE_DIR, "data", task_cfg.REGION_NAME or task_id)
+                data_dir = os.path.join(
+                    BASE_DIR, "data", overrides["REGION_NAME"] or task_id)
 
                 from engine.core import run_pipeline_v3
-                r = run_pipeline_v3(
-                    data_source_name=task_cfg.DATA_SOURCE,
-                    data_dir=data_dir,
-                    out_dir=out_dir,
-                    index_type=task_cfg.INDEX_TYPE,
-                    detection_mode=task_cfg.DETECTION_MODE,
-                )
+                # run_pipeline_v3 仍读取全局 config：任务期间临时覆盖，结束后还原
+                with _config_overrides(overrides):
+                    r = run_pipeline_v3(
+                        data_source_name=overrides["DATA_SOURCE"],
+                        data_dir=data_dir,
+                        out_dir=out_dir,
+                        index_type=overrides["INDEX_TYPE"],
+                        detection_mode=overrides["DETECTION_MODE"],
+                        threshold=task.get("threshold"),
+                        severe_threshold=task.get("severe_threshold"),
+                    )
 
                 elapsed = time.time() - t0
                 r["task_id"] = task_id

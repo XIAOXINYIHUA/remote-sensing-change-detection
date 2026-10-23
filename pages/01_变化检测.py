@@ -213,16 +213,22 @@ def _collect_data(y1, y2, ms, me, data_src, idx_type):
         m2 = sum(os.path.getsize(p) for p in b2.values() if os.path.exists(p)) / 1024 / 1024
         info_msg.success(f"✅ {y2} 年完成 ({m2:.0f} MB)")
 
+        # 质量波段 (SCL / QA_PIXEL) 供分析阶段做云掩膜
+        info_msg.info("📥 下载质量波段（云掩膜）...")
+        q1 = source.download_quality_bands(s1, data_dir)
+        q2 = source.download_quality_bands(s2, data_dir)
+
         total_mb = m1 + m2
 
         # —— 登记到 SnapshotCache，避免后续分析重复下载 ——
         try:
-            from engine.cache import SnapshotCache, compute_aoi_hash
-            import hashlib
+            from engine.cache import SnapshotCache, compute_aoi_hash, snapshot_key
+            from engine.preprocessing import PREPROCESSING_VERSION
             sc = SnapshotCache(cache_root=str(BASE_DIR / "data" / "cache"))
             aoi_hash = compute_aoi_hash(boundary)
-            raw_key = f"{aoi_hash}|{data_src}|{idx_type}|{y1}|{y2}"
-            new_key = hashlib.md5(raw_key.encode()).hexdigest()[:16]
+            new_key = snapshot_key(
+                aoi_hash, data_src, idx_type, y1, y2, ms, me,
+                config.MAX_CLOUD_PCT, needed, PREPROCESSING_VERSION)
             if not sc.has(new_key):
                 snap_dict = {
                     "region": region, "aoi_hash": aoi_hash,
@@ -231,13 +237,14 @@ def _collect_data(y1, y2, ms, me, data_src, idx_type):
                     "month_start": int(ms), "month_end": int(me),
                     "max_cloud_pct": config.MAX_CLOUD_PCT,
                     "bands": list(needed), "tile_ids": [],
-                    "preprocessing_version": "v3.1",
+                    "preprocessing_version": PREPROCESSING_VERSION,
                     "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 sc.put_snapshot(new_key, snap_dict)
                 import shutil
                 cache_dir = sc.get_band_dir(new_key)
-                for fpath in list(b1.values()) + list(b2.values()):
+                for fpath in (list(b1.values()) + list(b2.values())
+                              + list(q1.values()) + list(q2.values())):
                     if os.path.exists(fpath):
                         shutil.copy2(fpath, cache_dir)
                 sc.mark_complete(new_key)
@@ -348,6 +355,12 @@ def _run_analysis(y1, y2, ms, me, dmode, ct, sthr, ma, bf,
 
         st.session_state.cd_results = res
         st.session_state.cd_stats = res.get("stats")
+
+        unmasked = [k for k, v in res.get("preprocessing", {}).items()
+                    if not v.get("cloud_mask")]
+        if unmasked:
+            years = "、".join(str(y1 if k == "y1" else y2) for k in unmasked)
+            st.warning(f"⚠️ {years} 年缺少质量波段，未做云掩膜，云区可能被误判为变化。")
 
         # 加载 GeoTIFF 结果用于地图
         gtif = res.get("files", {}).get("geotiff")

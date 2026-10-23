@@ -154,43 +154,40 @@ def _filter_by_connected_components(binary_mask, min_area_px):
 def estimate_adaptive_threshold(diff, valid_mask, k_change=3.0, k_severe=5.0):
     """根据稳定区域的差异分布自动估计阈值。
 
-    策略: 对于大部分未变化区域，ndvi_diff 应接近 0。
-    取变化差异的 MAD (Median Absolute Deviation) 作为噪声水平估计。
+    策略: 大部分像元未变化，差值近似服从 N(μ, σ²)。用稳健估计
+    σ = 1.4826 * median(|diff - median(diff)|)（对少量真实变化不敏感），
+    阈值取 k·σ。
+
+    注意：不能对 |diff| 再取 MAD —— 那只有约 0.4σ，3 倍后仅 1.2σ，
+    纯噪声下会有 ~23% 的稳定像元被判为变化。
 
     Args:
         diff: 差值数组 (y2 - y1)
         valid_mask: 有效像元掩膜
-        k_change: 变化阈值 = k_change * MAD，默认 3.0
-        k_severe: 强烈变化阈值 = k_severe * MAD，默认 5.0
+        k_change: 变化阈值 = k_change * σ，默认 3.0
+        k_severe: 强烈变化阈值 = k_severe * σ，默认 5.0
 
     Returns:
         (change_threshold, severe_threshold)
     """
-    # 使用全图差异的中位数附近区域估计噪声
-    valid_diff = diff[valid_mask & (diff != 0)]
+    valid_diff = diff[valid_mask & np.isfinite(diff)]
 
     if len(valid_diff) < 100:
         # 像素太少时回退到 config
         return config.CHANGE_THRESHOLD, config.SEVERE_THRESHOLD
 
-    # 取绝对值
-    abs_diff = np.abs(valid_diff)
+    med = np.median(valid_diff)
+    sigma = 1.4826 * np.median(np.abs(valid_diff - med))
 
-    # MAD = median(|x - median(x)|)
-    med = np.median(abs_diff)
-    mad = np.median(np.abs(abs_diff - med))
-
-    if mad < 1e-6:
+    if sigma < 1e-6:
         return config.CHANGE_THRESHOLD, config.SEVERE_THRESHOLD
 
-    T = max(0.02, k_change * mad)
-    S = max(0.05, k_severe * mad)
+    # 限制在合理范围，且强烈阈值严格大于变化阈值
+    T = min(max(0.02, k_change * sigma), 0.5)
+    S = min(max(0.05, k_severe * sigma), 0.8)
+    S = max(S, T + 0.01)
 
-    log(f"  Adaptive threshold: MAD={mad:.4f}, T={T:.4f}, S={S:.4f}")
-
-    # 限制在合理范围
-    T = min(T, 0.5)
-    S = min(S, 0.8)
+    log(f"  Adaptive threshold: sigma={sigma:.4f}, T={T:.4f}, S={S:.4f}")
 
     return round(T, 4), round(S, 4)
 
@@ -337,11 +334,14 @@ def run_change_detection_v2(data_dir, out_dir, boundary_wgs84):
 def run_change_detection_generic(bands_y1, bands_y2, meta, boundary_wgs84,
                                   index_type="NDVI", detection_mode="multi",
                                   threshold=None, severe_threshold=None,
-                                  adaptive_threshold=False, min_area_m2=None):
+                                  adaptive_threshold=False, min_area_m2=None,
+                                  valid_mask=None):
     """v3 通用指数变化检测：支持 NDVI/NDWI/NBR/EVI/SAVI/MNDWI。
 
     阈值优先级:
         adaptive_threshold=True > 显式传入参数 > INDEX_THRESHOLDS > config
+
+    valid_mask: 预处理得到的有效像元（含云掩膜）；None 时退回「所有波段 > 0」。
     """
     from engine.indices import compute_index, INDEX_THRESHOLDS, INDEX_CLASS_NAMES
 
@@ -360,13 +360,17 @@ def run_change_detection_generic(bands_y1, bands_y2, meta, boundary_wgs84,
     except Exception:
         pass  # 非致命 — 元数据可能不完整
 
-    valid = np.ones((ref_h, ref_w), dtype=bool)
-    for arr in list(bands_y1.values()) + list(bands_y2.values()):
-        valid &= (arr > 0)
+    if valid_mask is not None:
+        valid = valid_mask.copy()
+    else:
+        valid = np.ones((ref_h, ref_w), dtype=bool)
+        for arr in list(bands_y1.values()) + list(bands_y2.values()):
+            valid &= (arr > 0)
 
     idx1 = compute_index(index_type, bands_y1)
     idx2 = compute_index(index_type, bands_y2)
     diff = idx2 - idx1
+    valid &= np.isfinite(diff)
     diff[~valid] = 0
 
     bnd_mask = boundary_pixel_mask(boundary_wgs84, meta, ref_h, ref_w)
@@ -934,6 +938,80 @@ def run_pipeline(data_dir=None, out_dir=None, boundary=None,
     return results
 
 
+def _cache_root():
+    """快照缓存根目录（测试中可替换）。"""
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "data", "cache")
+
+
+def _find_quality_file(directory, year):
+    """在目录中查找某年的质量波段文件 (SCL / QA_PIXEL)。"""
+    for prefix in ("SCL", "QA_PIXEL"):
+        path = os.path.join(directory, f"{prefix}_{year}.tif")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _load_aligned_bands(paths_y1, paths_y2, quality_y1, quality_y2, data_source):
+    """加载两期波段并对齐到统一网格，再在该网格上做定标 + 云掩膜。
+
+    云掩膜必须在对齐之后做：S2 的 SCL 为 20 m，B4/B8 为 10 m，
+    MNDWI/NBR 等还混用 10 m 与 20 m 波段。
+
+    Args:
+        paths_y1/paths_y2: {波段名: GeoTIFF 路径}（原始 DN）
+        quality_y1/quality_y2: 质量波段路径，None=不做云掩膜
+        data_source: 数据源名称
+
+    Returns:
+        (ay1, ay2, valid, meta, prep_info)，无可用波段时返回 None。
+        ay1/ay2 为反射率，valid 为两期共同有效像元。
+    """
+    from engine.preprocessing import preprocess_arrays, quality_valid_on_grid
+
+    target_grid, meta = None, None
+    for path in list(paths_y1.values()) + list(paths_y2.values()):
+        if path and os.path.exists(path):
+            with rasterio.open(path) as src:
+                target_grid = GridSpec.from_src(src)
+                meta = src.meta
+            break
+    if target_grid is None:
+        return None
+    log(f"  Target grid: {target_grid}")
+
+    def _read_aligned(path):
+        with rasterio.open(path) as src:
+            arr = src.read(1).astype(np.float32)
+            if GridSpec.from_src(src) != target_grid:
+                arr = reproject_to_grid((arr, src.meta), target_grid)
+        return arr
+
+    aligned, valid, prep_info = [], None, {}
+    for key, paths, qpath in (("y1", paths_y1, quality_y1),
+                              ("y2", paths_y2, quality_y2)):
+        raw = {bn: _read_aligned(p) for bn, p in paths.items()
+               if p and os.path.exists(p)}
+        qvalid = None
+        if qpath and os.path.exists(qpath):
+            qvalid = quality_valid_on_grid(qpath, data_source, target_grid)
+        bands, v = preprocess_arrays(raw, data_source, qvalid)
+
+        has_data = np.logical_and.reduce([a > 0 for a in raw.values()])
+        cloud_pct = None
+        if qvalid is not None:
+            cloud_pct = round(
+                float((has_data & ~qvalid).sum()) * 100 / max(int(has_data.sum()), 1), 2)
+            log(f"  Cloud mask {key}: {cloud_pct}% of data pixels masked")
+        prep_info[key] = {"cloud_mask": qvalid is not None, "cloud_pct": cloud_pct}
+
+        aligned.append(bands)
+        valid = v if valid is None else (valid & v)
+
+    return aligned[0], aligned[1], valid, meta, prep_info
+
+
 def run_pipeline_v3(data_source_name="sentinel2", data_dir=None, out_dir=None,
                      boundary=None, bands=None, index_type=None,
                      detection_mode=None, progress_callback=None,
@@ -986,20 +1064,25 @@ def run_pipeline_v3(data_source_name="sentinel2", data_dir=None, out_dir=None,
     needed = bands or get_needed_bands(idx)
     log(f"Data source: {source.name}, Index: {idx}, Bands: {needed}")
 
+    from engine.preprocessing import PREPROCESSING_VERSION
+
     # =========================================================================
     #  检查已有缓存，避免重复下载
+    #  缓存只存原始 DN + 质量波段，预处理每次在内存中执行
     # =========================================================================
     cache_key = None
     aoi_hash = None
+    q1_path = q2_path = None
     try:
         from engine.cache import SnapshotCache, compute_aoi_hash
-        sc = SnapshotCache(cache_root=os.path.join(base, "data", "cache"))
+        sc = SnapshotCache(cache_root=_cache_root())
         aoi_hash = compute_aoi_hash(boundary)
         cached_key = sc.find(
             aoi_hash, data_source_name, idx,
             config.YEAR1, config.YEAR2,
             config.MONTH_START, config.MONTH_END,
-            config.MAX_CLOUD_PCT, needed)
+            config.MAX_CLOUD_PCT, needed,
+            preprocessing_version=PREPROCESSING_VERSION)
         if cached_key:
             cache_key = cached_key
             cached_dir = sc.get_band_dir(cached_key)
@@ -1016,6 +1099,8 @@ def run_pipeline_v3(data_source_name="sentinel2", data_dir=None, out_dir=None,
                     by2[bn] = y2_path
             if len(by1) == len(needed) and len(by2) == len(needed):
                 cb(f"✅ 使用缓存数据 ({cached_key[:8]}...)", 25)
+                q1_path = _find_quality_file(cached_dir, config.YEAR1)
+                q2_path = _find_quality_file(cached_dir, config.YEAR2)
                 source_pending_dl = False
             else:
                 by1, by2 = {}, {}
@@ -1045,47 +1130,22 @@ def run_pipeline_v3(data_source_name="sentinel2", data_dir=None, out_dir=None,
         cb(f"下载 {config.YEAR2} 年波段...", 45)
         by2 = source.download_bands(s2, data_dir, needed)
 
-        # --- 下载质量波段 (SCL / QA_PIXEL) ---
+        # --- 下载质量波段 (SCL / QA_PIXEL)，云掩膜在对齐后的网格上执行 ---
         q1 = source.download_quality_bands(s1, data_dir) if hasattr(source, "download_quality_bands") else {}
         q2 = source.download_quality_bands(s2, data_dir) if hasattr(source, "download_quality_bands") else {}
+        q1_path = next(iter(q1.values()), None)
+        q2_path = next(iter(q2.values()), None)
 
-        # --- 预处理: 云掩膜 + 比例因子 ---
-        try:
-            from engine.preprocessing import preprocess_bands
-            for year_key, bands_dict, quality_dict in [
-                ("Y1", by1, q1), ("Y2", by2, q2)]:
-                scl_path = quality_dict.get("scl")
-                qa_path = quality_dict.get("qa_pixel")
-                if scl_path or qa_path:
-                    processed, valid_mask = preprocess_bands(
-                        bands_dict, data_source=data_source_name,
-                        apply_scale=True, cloud_mask=True,
-                        scl_path=scl_path, qa_path=qa_path)
-                    # 保留预处理后的波段 — 用原始元数据写回原路径
-                    for bn in needed:
-                        if bn in processed:
-                            out_p = bands_dict[bn]
-                            try:
-                                with rasterio.open(out_p) as src:
-                                    pm = src.meta.copy()
-                                pm.update(dtype="float32", compress="lzw")
-                                with rasterio.open(out_p, "w", **pm) as dst:
-                                    dst.write(processed[bn].astype(np.float32), 1)
-                                log(f"  Preprocessed: {bn}/{year_key}")
-                            except Exception as e2:
-                                log(f"  Write back failed for {bn}: {e2}")
-        except Exception as e:
-            log(f"  Preprocessing skipped: {e}")
-            # 非致命 — 使用原始 DN
-
-        # 存入缓存
+        # 存入缓存（原始 DN，不写回预处理结果，避免重复定标）
         if aoi_hash and cache_key is None:
             try:
-                from engine.cache import SnapshotCache
-                sc = SnapshotCache(cache_root=os.path.join(base, "data", "cache"))
-                import hashlib, json
-                raw_key = f"{aoi_hash}|{data_source_name}|{idx}|{config.YEAR1}|{config.YEAR2}"
-                new_key = hashlib.md5(raw_key.encode()).hexdigest()[:16]
+                from engine.cache import SnapshotCache, snapshot_key
+                sc = SnapshotCache(cache_root=_cache_root())
+                new_key = snapshot_key(
+                    aoi_hash, data_source_name, idx,
+                    config.YEAR1, config.YEAR2,
+                    config.MONTH_START, config.MONTH_END,
+                    config.MAX_CLOUD_PCT, needed, PREPROCESSING_VERSION)
                 snap_dict = {
                     "region": config.REGION_NAME, "aoi_hash": aoi_hash,
                     "data_source": data_source_name, "index_type": idx,
@@ -1095,7 +1155,7 @@ def run_pipeline_v3(data_source_name="sentinel2", data_dir=None, out_dir=None,
                     "max_cloud_pct": config.MAX_CLOUD_PCT,
                     "bands": list(needed),
                     "tile_ids": [],
-                    "preprocessing_version": "v3.1",
+                    "preprocessing_version": PREPROCESSING_VERSION,
                     "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 sc.put_snapshot(new_key, snap_dict)
@@ -1114,62 +1174,21 @@ def run_pipeline_v3(data_source_name="sentinel2", data_dir=None, out_dir=None,
                 log(f"  Cache write skipped: {e}")
 
     cb("加载波段数据...", 55)
-    ay1, ay2, meta = {}, {}, None
-
-    # 先确定目标网格（取第一个有效文件为参考）
-    target_grid = None
-    all_band_paths = []
-    for bn in needed:
-        if bn in by1 and os.path.exists(by1[bn]):
-            all_band_paths.append((by1[bn], f"y1_{bn}"))
-        if bn in by2 and os.path.exists(by2[bn]):
-            all_band_paths.append((by2[bn], f"y2_{bn}"))
-
-    for fpath, label in all_band_paths:
-        try:
-            with rasterio.open(fpath) as src:
-                if target_grid is None:
-                    target_grid = GridSpec.from_src(src)
-                    meta = src.meta
-                    log(f"  Target grid: {target_grid}")
-        except Exception:
-            continue
-
-    if target_grid is None:
+    loaded = _load_aligned_bands(by1, by2, q1_path, q2_path, data_source_name)
+    if loaded is None:
         results["error"] = "Failed to determine target grid"
         return results
-
-    # 将所有波段重投影到统一网格
-    for bn in needed:
-        if bn in by1 and os.path.exists(by1[bn]):
-            with rasterio.open(by1[bn]) as src:
-                gs = GridSpec.from_src(src)
-                arr = src.read(1).astype(np.float32)
-                if gs != target_grid:
-                    from engine.grid import reproject_to_grid
-                    arr = reproject_to_grid((arr, src.meta), target_grid)
-                ay1[bn] = arr
-        if bn in by2 and os.path.exists(by2[bn]):
-            with rasterio.open(by2[bn]) as src:
-                gs = GridSpec.from_src(src)
-                arr = src.read(1).astype(np.float32)
-                if gs != target_grid:
-                    from engine.grid import reproject_to_grid
-                    arr = reproject_to_grid((arr, src.meta), target_grid)
-                ay2[bn] = arr
-
-    if meta is None:
-        results["error"] = "Failed to load band data"
-        return results
+    ay1, ay2, valid, meta, prep_info = loaded
+    results["preprocessing"] = prep_info
+    for key in ("y1", "y2"):
+        if not prep_info[key]["cloud_mask"]:
+            log(f"  WARNING: {key} 缺少质量波段，未做云掩膜")
 
     cb("运行变化检测...", 65)
     t_cd = time.time()
 
     if dmode == "ml":
         from engine.ml_detector import run_ml_change_detection
-        valid = np.ones_like(list(ay1.values())[0], dtype=bool)
-        for a in list(ay1.values()) + list(ay2.values()):
-            valid &= (a > 0)
         result, stats = run_ml_change_detection(
             ay1, ay2, valid,
             method=getattr(config, 'ML_MODEL', 'random_forest'),
@@ -1179,7 +1198,8 @@ def run_pipeline_v3(data_source_name="sentinel2", data_dir=None, out_dir=None,
             ay1, ay2, meta, boundary,
             index_type=idx, detection_mode=dmode,
             threshold=threshold, severe_threshold=severe_threshold,
-            adaptive_threshold=adaptive_threshold, min_area_m2=min_area_m2)
+            adaptive_threshold=adaptive_threshold, min_area_m2=min_area_m2,
+            valid_mask=valid)
 
     results["timing"]["change_detection"] = round(time.time() - t_cd, 1)
     results["stats"] = stats

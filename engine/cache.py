@@ -134,10 +134,12 @@ class SnapshotCache:
 
     def find(self, aoi_hash: str, data_source: str, index_type: str,
              year1: int, year2: int, month_start: int, month_end: int,
-             max_cloud_pct: float, bands: T.Sequence[str]) -> str | None:
+             max_cloud_pct: float, bands: T.Sequence[str],
+             preprocessing_version: str | None = None) -> str | None:
         """在现有缓存中查找匹配的快照，返回 cache_key 或 None。
 
         遍历所有缓存目录，找到完全匹配的条目。
+        preprocessing_version 非 None 时还要求预处理版本一致（旧缓存自动失效）。
         """
         if not os.path.exists(self.root):
             return None
@@ -159,7 +161,9 @@ class SnapshotCache:
                     and snap.get("month_start") == month_start
                     and snap.get("month_end") == month_end
                     and snap.get("max_cloud_pct") == max_cloud_pct
-                    and set(snap.get("bands", [])) == set(bands)):
+                    and set(snap.get("bands", [])) == set(bands)
+                    and (preprocessing_version is None
+                         or snap.get("preprocessing_version") == preprocessing_version)):
                 if self.has(entry_name):
                     return entry_name
         return None
@@ -209,6 +213,21 @@ class SnapshotCache:
 
 
 from pathlib import Path
+
+
+def snapshot_key(aoi_hash: str, data_source: str, index_type: str,
+                 year1: int, year2: int, month_start: int, month_end: int,
+                 max_cloud_pct: float, bands: T.Sequence[str],
+                 preprocessing_version: str) -> str:
+    """由 find() 的全部匹配字段生成缓存目录名，参数不同的快照互不覆盖。"""
+    raw = "|".join([
+        aoi_hash, data_source, index_type,
+        str(int(year1)), str(int(year2)),
+        str(int(month_start)), str(int(month_end)),
+        str(max_cloud_pct), ",".join(sorted(bands)),
+        preprocessing_version,
+    ])
+    return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 
 def compute_aoi_hash(boundary_wgs84) -> str:

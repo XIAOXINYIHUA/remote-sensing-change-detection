@@ -10,6 +10,7 @@ import rasterio
 from rasterio.merge import merge
 from shapely.geometry import box as sbox
 
+from engine.preprocessing import harmonize_s2_dn, s2_boa_offset
 
 import calendar
 
@@ -116,6 +117,9 @@ class Sentinel2DataSource:
             meta.update(
                 height=arr.shape[1], width=arr.shape[2],
                 driver="GTiff", compress="lzw")
+        if band_name != "scl":
+            # 逐景归一化基线 04.00 偏移（镶嵌前做，混合日期的瓦片也正确）
+            arr = harmonize_s2_dn(arr, s2_boa_offset(item))
         with rasterio.open(out_path, "w", **meta) as dst:
             dst.write(arr)
         return out_path
@@ -571,7 +575,7 @@ def _download_qa_pixel_generic(scenes, out_dir, download_fn) -> dict[str, str]:
                     os.remove(p)
                 except OSError:
                     pass
-    return {"qa_pixel": qa_sources[0][0]}
+    return {"qa_pixel": out_path}
 
 
 def get_data_source(name):
