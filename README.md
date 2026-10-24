@@ -3,6 +3,53 @@
 一站式遥感影像分析平台：**数据获取 → 变化检测 → 地物分类 → 时间序列 → 报告生成**。
 基于 Sentinel-2 / Landsat 多源影像，提供 Streamlit Web 工作台、CLI 与批量任务三种使用方式。
 
+[![CI](https://github.com/XIAOXINYIHUA/remote-sensing-change-detection/actions/workflows/ci.yml/badge.svg)](https://github.com/XIAOXINYIHUA/remote-sensing-change-detection/actions/workflows/ci.yml)
+[![gitleaks](https://github.com/XIAOXINYIHUA/remote-sensing-change-detection/actions/workflows/gitleaks.yml/badge.svg)](https://github.com/XIAOXINYIHUA/remote-sensing-change-detection/actions/workflows/gitleaks.yml)
+![python](https://img.shields.io/badge/python-3.10%2B-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+
+**Highlights**
+
+- **无需 API Key**：影像来自公开的 [Planetary Computer](https://planetarycomputer.microsoft.com/) STAC 目录，开箱即用
+- **三种检测模式**：多级 5 级分类 / 二值 / 随机森林（ML）；7 种光谱指数（NDVI / NDWI / MNDWI / NBR / EVI / SAVI / NDBI）
+- **严格的时间序列统计**：逐像元 Mann-Kendall 趋势检验 + Theil-Sen 斜率估计（向量化实现）
+- **工程化**：统一确定性网格与快照缓存、后台任务中心、离线 pytest 回归、Docker 部署、CI 双矩阵
+
+## 目录
+
+- [快速开始](#快速开始)
+- [功能模块](#功能模块)
+- [方法原理](#方法原理)
+- [配置说明](#配置说明)
+- [输出文件](#输出文件)
+- [项目结构](#项目结构)
+- [版本历史](#版本历史)
+- [License](#license)
+
+## 快速开始
+
+```bash
+# 环境要求: Python 3.10+，Windows / macOS / Linux
+pip install -e ".[web]"          # 或 pip install -r requirements.txt
+
+# Web 工作台（推荐）
+streamlit run app.py
+
+# CLI：用仓库自带的约 5 km × 5 km 示例区域试跑（未指定的参数取 config.py 默认值）
+python main.py --boundary examples/sample_aoi.geojson --region 示例区 --year1 2023 --year2 2024 --index NDVI
+python main.py --help
+
+# 批量任务
+python batch/batch_runner.py --config batch/batch_config.json
+
+# Docker
+docker compose -f docker/docker-compose.yml up
+# 国内网络构建镜像时可指定镜像源（不指定则用官方源）
+docker compose -f docker/docker-compose.yml build \
+  --build-arg APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn \
+  --build-arg PIP_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
 ## 功能模块
 
 ### 变化检测（engine/core.py）
@@ -55,32 +102,6 @@
 
 后处理:    连通域分析 → 按斑块实际面积过滤 → 质心采样点
 ```
-
-## 快速开始
-
-```bash
-# 环境要求: Python 3.10+，Windows / macOS / Linux
-pip install -e ".[web]"          # 或 pip install -r requirements.txt
-
-# Web 工作台（推荐）
-streamlit run app.py
-
-# CLI：用仓库自带的约 5 km × 5 km 示例区域试跑（未指定的参数取 config.py 默认值）
-python main.py --boundary examples/sample_aoi.geojson --region 示例区 --year1 2023 --year2 2024 --index NDVI
-python main.py --help
-
-# 批量任务
-python batch/batch_runner.py --config batch/batch_config.json
-
-# Docker
-docker compose -f docker/docker-compose.yml up
-# 国内网络构建镜像时可指定镜像源（不指定则用官方源）
-docker compose -f docker/docker-compose.yml build \
-  --build-arg APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn \
-  --build-arg PIP_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-无需 API Key：影像数据来自公开的 [Planetary Computer](https://planetarycomputer.microsoft.com/) STAC 目录（Sentinel-2 L2A 由 ESA 提供）。
 
 ## 配置说明
 
@@ -143,49 +164,9 @@ config.py    全局参数
   页面只提交任务并显示进度（可取消）；切换页面、刷新或关闭浏览器不影响任务，回到页面自动载入结果。
   任务中心列出全部后台任务（进度、取消、重试、日志）。任务记录在 `data/jobs/`，
   同时运行数见 `config.JOB_MAX_WORKERS`；应用关闭时未结束的任务下次启动记为「已中断」，可重试。
-  环境变量：`RSAP_JOBS_DIR` 任务目录、`RSAP_JOB_WORKERS` 同时运行数、`RSAP_CACHE_DIR` 快照缓存目录、
-  `RSAP_JOB_MODE=thread` 改在服务进程的线程中执行（测试用）
-- 一个项目一个状态文件 `.project_state.json`（目录可用 `RSAP_STATE_DIR` 改，Docker 镜像放在 `data/`）：区域、项目设置、
-  分析记录与各页需要保留的状态都在里面。分析区域以项目为准，任一页面切换区域，其他页面清掉旧区域的
-  影像与结果；多个浏览器标签页共用同一文件。首次启动时自动并入旧版的 `.shared_state.json`、
-  `.app_state.json`、`.classify_state.json`、`.ts_state.json`、`.batch_state.json`，
-  旧文件不再使用，确认无误后可删除
-- 清理：删除无引用的函数、旧版前端组件（`frontend/components/params.py`、`charts.py`、
-  `frontend/pages/`）；按钮等组件的 `use_container_width` 改为 Streamlit 1.58 的 `width` 参数
-  （依赖下限相应提到 `streamlit>=1.58`）；ruff 启用未使用导入 / 变量检查
-- Docker：状态文件与缓存目录改到容器用户可写的位置；构建参数 `APT_MIRROR` / `PIP_MIRROR` 可指定镜像源
-- 修正：地物分类面积统计按实际像元大小（Landsat 30 m）；主动学习斑块数设置生效；
-  时间序列至少 4 期（与逐像元最少观测数一致）；PDF 报告填入区域面积
 
-### v3.2 — 商业化加固
-- 数据获取改为 AOI 窗口读取 + 确定性 UTM 分析网格，跨 UTM 带瓦片正确镶嵌
-- 时间序列：多期统一网格 + 云掩膜，Mann-Kendall / Sen 斜率向量化
-- 采样点：按类别分别做连通域、内部代表点、按米稀疏、真实像元面积；Shapefile 坐标系修正
-- 报告：随指数与实际阈值变化，补齐 NDBI 类别名 / 配色 / 阈值
-- `RunParams` 取代运行时改写全局 `config`；Web 端资料收集与分析共享快照缓存
-- `pyproject.toml`、精简 Docker 镜像、示例 AOI、GitHub Actions CI
-
-### v3.1 — P0 正确性修复
-- 云掩膜在对齐网格上执行；Sentinel-2 基线偏移归一化；自适应阈值改用稳健 σ
-- 批量运行器崩溃修复；主动学习斑块落在高不确定区域
-
-### v3.0 (2026-07) — 平台化重构
-- 与地物分类器合并为统一分析平台，算法层模块化拆分至 `engine/`
-- 新增：7 种光谱指数、随机森林检测模式、GMM 聚类 + 纹理特征分类
-- 新增：Mann-Kendall + Theil-Sen 逐像元时序趋势模块
-- 新增：Landsat 8/9 数据源、批量任务调度、PDF 报告、Docker 部署
-- 新增：Streamlit 多页工作台（7 页）与任务中心 / 成果库
-
-### v2.1 (2026-06-29) — 性能优化
-- 修复 matplotlib 报告中文乱码（自动检测系统字体）
-- 修复 Windows 控制台输出乱码（Unicode 容错）
-- 连通域过滤向量化（numpy 索引替代 Python 循环）
-- 采样点生成批量坐标变换 + prepared geometry 空间查询
-- 地图自适应降采样渲染
-
-### v2.0 — 算法升级
-- 多级 5 级分级检测、连通域逐斑块面积过滤、可选双边预滤波
-- GeoJSON + CSV + Shapefile 多格式导出、Streamlit Web 前端
+### v3.0 — 平台化重构
+- 变化检测 / 地物分类 / 时间序列模块化重构，P0 正确性修复（云掩膜、S2 基线偏移、自适应阈值、批量运行器、主动学习选点）
 
 ### v1.0 — 基础版本
 - 二值 NDVI 变化检测、形态学开运算去噪、单格式 GeoJSON 导出
