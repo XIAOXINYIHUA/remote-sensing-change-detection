@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 from pathlib import Path
 
 _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -12,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from frontend.components.ui import empty_state, page_header, section_header, task_row_heading
+from frontend.inventory import unarchived_outputs
 from frontend.project_state import ProjectState
 from frontend.utils import setup_matplotlib_font
 
@@ -39,15 +41,41 @@ mime_types = {
     ".zip": "application/zip",
 }
 
+def _download_buttons(entries, key_prefix):
+    """为 (标签, 路径) 列表逐个渲染下载按钮，返回实际存在的文件数。"""
+    available = 0
+    for label, raw_path in entries:
+        path = Path(raw_path) if raw_path else None
+        if not path or not path.exists():
+            continue
+        available += 1
+        st.caption(f"{label.upper()} · {path.stat().st_size / 1024:,.0f} KB")
+        with path.open("rb") as handle:
+            st.download_button(
+                path.name,
+                handle.read(),
+                path.name,
+                mime_types.get(path.suffix.lower(), "application/octet-stream"),
+                key=f"{key_prefix}_{label}_{path.name}",
+                icon=":material/download:",
+                width="stretch",
+            )
+    return available
+
+
 successful = [task for task in ps.task_history if task.get("status") == "success"]
-existing_files = []
-for task in successful:
-    existing_files.extend(
-        Path(path) for path in task.get("output_files", {}).values()
-        if path and os.path.exists(path)
-    )
-total_size_mb = sum(path.stat().st_size for path in existing_files) / 1024 / 1024
+archived_paths = [
+    path for task in successful for path in task.get("output_files", {}).values() if path
+]
+existing_files = [Path(path) for path in archived_paths if os.path.exists(path)]
+# CLI / 批量任务 / 旧版本生成、没有任务记录的输出也要能在成果库里找到
+loose_groups = unarchived_outputs(Path(_base) / "output", archived_paths)
+loose_count = sum(len(group["files"]) for group in loose_groups)
+total_size_mb = (sum(path.stat().st_size for path in existing_files) / 1024 / 1024
+                 + sum(group["size_mb"] for group in loose_groups))
 regions = sorted({task.get("region", "未命名区域") for task in successful})
+project_names = set(regions) | {group["region"] for group in loose_groups}
+has_results = bool(successful or loose_groups)
 
 page_header(
     "成果库",
@@ -55,22 +83,23 @@ page_header(
     "已完成分析的版本、摘要与输出文件。",
     meta={
         "成果": len(successful),
-        "项目": len(regions),
-        "文件": len(existing_files),
+        "项目": len(project_names),
+        "文件": len(existing_files) + loose_count,
         "占用": f"{total_size_mb:,.1f} MB",
     },
-    status="成果可用" if successful else "暂无成果",
-    status_tone="success" if successful else "neutral",
+    status="成果可用" if has_results else "暂无成果",
+    status_tone="success" if has_results else "neutral",
 )
 
-if not successful:
+if not has_results:
     section_header("分析成果", "完成分析后自动归档。", "归档")
     empty_state("暂无分析成果", "成功完成的任务会在这里生成版本记录。", "00")
     st.page_link(
         "pages/00_首页.py", label="返回项目总览",
-        icon=":material/arrow_back:", use_container_width=False,
+        icon=":material/arrow_back:",
     )
-else:
+
+if successful:
     # Assign versions chronologically so the newest result receives the highest version.
     version_counter = {}
     version_by_id = {}
@@ -120,28 +149,12 @@ else:
             with open_col:
                 if st.button(
                     "打开", icon=":material/open_in_new:",
-                    key=f"result_open_{task_id}_{index}", use_container_width=True,
+                    key=f"result_open_{task_id}_{index}", width="stretch",
                 ):
                     st.switch_page(target_pages.get(mode, "pages/01_变化检测.py"))
             with files_col:
-                with st.popover("输出文件", icon=":material/folder_open:", use_container_width=True):
-                    available = 0
-                    for file_type, file_path in files.items():
-                        path = Path(file_path) if file_path else None
-                        if path and path.exists():
-                            available += 1
-                            st.caption(f"{file_type.upper()} · {path.stat().st_size / 1024:,.0f} KB")
-                            with path.open("rb") as handle:
-                                st.download_button(
-                                    path.name,
-                                    handle.read(),
-                                    path.name,
-                                    mime_types.get(path.suffix.lower(), "application/octet-stream"),
-                                    key=f"download_{task_id}_{index}_{file_type}",
-                                    icon=":material/download:",
-                                    use_container_width=True,
-                                )
-                    if not available:
+                with st.popover("输出文件", icon=":material/folder_open:", width="stretch"):
+                    if not _download_buttons(files.items(), f"download_{task_id}_{index}"):
                         st.caption("输出文件已移动或删除")
 
     section_header("成果汇总", "当前筛选结果的关键执行信息。", "对比")
@@ -157,4 +170,29 @@ else:
         }
         for task in filtered
     ]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), hide_index=True)
+
+if loose_groups:
+    section_header(
+        "未归档的输出",
+        "output 目录中没有任务记录的文件，来自命令行、批量任务或旧版本。",
+        "文件",
+    )
+    for group_index, group in enumerate(loose_groups):
+        modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(group["modified"]))
+        with st.container(border=True):
+            text_col, files_col = st.columns([6, 1.6])
+            with text_col:
+                task_row_heading(
+                    group["region"],
+                    "未归档输出",
+                    f"{len(group['files'])} 个文件",
+                    "info",
+                    f"{group['size_mb']:,.1f} MB · 最近修改 {modified}",
+                )
+            with files_col:
+                with st.popover("输出文件", icon=":material/folder_open:", width="stretch"):
+                    _download_buttons(
+                        [(path.suffix.lstrip(".") or "file", path) for path in group["files"]],
+                        f"loose_{group_index}",
+                    )

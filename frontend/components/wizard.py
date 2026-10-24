@@ -7,6 +7,7 @@ from pathlib import Path
 
 import streamlit as st
 
+from engine.utils import geodesic_area_km2
 from frontend.components.ui import page_header, section_header, status_banner, workflow_bar
 from frontend.project_state import ProjectState
 from frontend.utils import (
@@ -57,13 +58,32 @@ PROBLEM_TYPES = {
         "available_indices": ["NDVI", "NDWI", "NBR", "EVI"],
         "available_sources": ["sentinel2", "landsat8", "landsat9"],
     },
-    "SAR 洪水与湿度": {
-        "recommended": {"data_source": "sentinel1", "index_type": ""},
-        "description": "基于 Sentinel-1 雷达数据的洪水与湿度变化。",
-        "available_indices": [],
-        "available_sources": ["sentinel1"],
-    },
 }
+
+# 尚未实现的分析目标：只作说明展示，不可选，避免进入无法运行的流程
+PLANNED_PROBLEM_TYPES = {
+    "SAR 洪水与湿度": "需要 Sentinel-1 VV/VH 雷达指数（如 RVI），尚未实现",
+}
+
+PROBLEM_PAGES = {
+    "植被退化与恢复": "pages/01_变化检测.py",
+    "水体变化": "pages/01_变化检测.py",
+    "火烧迹地": "pages/01_变化检测.py",
+    "建设用地扩张": "pages/01_变化检测.py",
+    "地物分类": "pages/02_地物分类.py",
+    "长期趋势分析": "pages/03_时间序列.py",
+}
+
+
+def usable_indices(problem_name: str, source: str) -> list[str]:
+    """分析目标在给定数据源上真正可运行的指数（"ALL" 表示全部波段）。"""
+    allowed = CAPABILITY_MATRIX.get(source, [])
+    if not allowed:
+        return []
+    return [
+        item for item in PROBLEM_TYPES[problem_name]["available_indices"]
+        if item == "ALL" or item in allowed
+    ]
 
 
 def render_wizard() -> bool:
@@ -112,7 +132,7 @@ def _wizard_step_1_region(ps) -> bool:
             )
             if st.button(
                 "使用所选边界", type="primary", icon=":material/check:",
-                use_container_width=True,
+                width="stretch",
             ):
                 chosen = existing[selected]
                 ProjectState.set_aoi(detect_region(chosen), chosen)
@@ -176,7 +196,7 @@ def _wizard_step_1_region(ps) -> bool:
         )
         if st.button(
             "检索并获取边界", icon=":material/search:",
-            use_container_width=True, disabled=not search.strip(),
+            width="stretch", disabled=not search.strip(),
         ):
             with st.spinner(f"正在检索 {search.strip()}..."):
                 geojson, error = fetch_boundary_osm(search.strip())
@@ -221,7 +241,7 @@ def _wizard_step_1_region(ps) -> bool:
         with next_col:
             if st.button(
                 "下一步", type="primary", icon=":material/arrow_forward:",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state.wizard_step = 1
                 st.rerun()
@@ -242,6 +262,8 @@ def _wizard_step_2_target(ps) -> bool:
             key="wizard_problem_selector",
         )
         st.session_state.wizard_prob_idx = options.index(selected_problem)
+        for name, reason in PLANNED_PROBLEM_TYPES.items():
+            st.caption(f"规划中：{name}（{reason}）")
 
     problem = PROBLEM_TYPES[selected_problem]
     recommended = problem["recommended"]
@@ -269,19 +291,8 @@ def _wizard_step_2_target(ps) -> bool:
             key="wizard_ds_selector",
         )
 
-        allowed_for_source = CAPABILITY_MATRIX.get(
-            chosen_source, problem["available_indices"]
-        )
-        index_options = [
-            item for item in problem["available_indices"]
-            if item == "ALL" or item in allowed_for_source
-        ]
-        if chosen_source == "sentinel1" and not index_options:
-            index_options = ["--"]
-        if not index_options:
-            index_options = allowed_for_source or ["--"]
-
-        if index_options[0] != "--":
+        index_options = usable_indices(selected_problem, chosen_source)
+        if index_options:
             current_index_type = (
                 ps.index_type if ps.index_type in index_options
                 else recommended["index_type"] if recommended["index_type"] in index_options
@@ -298,37 +309,28 @@ def _wizard_step_2_target(ps) -> bool:
                 key="wizard_idx_selector",
             )
         else:
-            chosen_index = "--"
-            status_banner("warning", "当前数据源不提供光谱指数")
+            chosen_index = None
+            status_banner("warning", "当前数据源不提供该目标可用的光谱指数", "请换一个数据源。")
 
         ps.data_source = chosen_source
-        if chosen_index != "--":
+        if chosen_index:
             ps.index_type = chosen_index
         ProjectState.commit()
-
-    problem_to_page = {
-        "植被退化与恢复": "pages/01_变化检测.py",
-        "水体变化": "pages/01_变化检测.py",
-        "火烧迹地": "pages/01_变化检测.py",
-        "建设用地扩张": "pages/01_变化检测.py",
-        "地物分类": "pages/02_地物分类.py",
-        "长期趋势分析": "pages/03_时间序列.py",
-        "SAR 洪水与湿度": "pages/01_变化检测.py",
-    }
 
     back_col, _, next_col = st.columns([1, 2, 1])
     with back_col:
         if st.button(
-            "上一步", icon=":material/arrow_back:", use_container_width=True,
+            "上一步", icon=":material/arrow_back:", width="stretch",
         ):
             st.session_state.wizard_step = 0
             st.rerun()
     with next_col:
         if st.button(
             "下一步", type="primary", icon=":material/arrow_forward:",
-            use_container_width=True,
+            width="stretch", disabled=chosen_index is None,
+            key="wizard_target_next",
         ):
-            st.session_state.wizard_target_page = problem_to_page[selected_problem]
+            st.session_state.wizard_target_page = PROBLEM_PAGES[selected_problem]
             st.session_state.wizard_step = 2
             st.rerun()
     return False
@@ -344,7 +346,7 @@ def _wizard_step_3_confirm(ps) -> bool:
         center_text = "--"
         try:
             _, geometry = load_gj(ps.boundary)
-            area_text = f"{geometry.area * (111.32 ** 2):,.1f} km²"
+            area_text = f"{geodesic_area_km2(geometry):,.1f} km²"
             center_text = f"{geometry.centroid.y:.3f}, {geometry.centroid.x:.3f}"
         except Exception:
             pass
@@ -360,7 +362,6 @@ def _wizard_step_3_confirm(ps) -> bool:
                     ps.index_type,
                 ],
             },
-            use_container_width=True,
             hide_index=True,
         )
 
@@ -396,7 +397,7 @@ def _wizard_step_3_confirm(ps) -> bool:
     back_col, _, start_col = st.columns([1, 2, 1])
     with back_col:
         if st.button(
-            "上一步", icon=":material/arrow_back:", use_container_width=True,
+            "上一步", icon=":material/arrow_back:", width="stretch",
         ):
             st.session_state.wizard_step = 1
             st.rerun()
@@ -405,20 +406,11 @@ def _wizard_step_3_confirm(ps) -> bool:
             "进入工作台",
             type="primary",
             icon=":material/arrow_forward:",
-            use_container_width=True,
+            width="stretch",
             disabled=not valid_period,
         ):
-            import config as cfg
-
-            cfg.REGION_NAME = ps.region
-            cfg.YEAR1 = ps.year1
-            cfg.YEAR2 = ps.year2
-            cfg.MONTH_START = ps.month_start
-            cfg.MONTH_END = ps.month_end
-            cfg.DATA_SOURCE = ps.data_source
-            cfg.INDEX_TYPE = ps.index_type
-            cfg.BOUNDARY_FILE = ps.boundary
-
+            # 向导选择保存在 ProjectState（按会话），工作台控件以此为默认值；
+            # 不写全局 config，避免多会话互相覆盖
             st.session_state.wizard_complete = True
             st.session_state._cd_wizard_active = True
             target = st.session_state.get("wizard_target_page", "")

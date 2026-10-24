@@ -6,7 +6,7 @@
   阶段2: 一键运行变化检测分析
 """
 
-import os, sys, json, io, re, time, warnings
+import os, sys, io, warnings
 warnings.filterwarnings("ignore")
 
 # GDAL 临时文件指向项目盘（避免写 C 盘）
@@ -24,33 +24,31 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 import folium
 from folium.plugins import Fullscreen
 from streamlit_folium import st_folium
-from shapely.geometry import shape
-import rasterio
-import requests
 
 BASE_DIR = Path(__file__).parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 import config
-from engine.utils import log, get_needed_bands, INDEX_BAND_REQUIREMENTS
-from engine.data_sources import get_data_source
-from engine.core import run_pipeline_v3
+from engine.utils import get_needed_bands
+from engine.core import find_cached_snapshot
+from engine.params import RunParams
+from services import change_detection as cd_svc
 
 from frontend.utils import (
-    inject_global_css,
     setup_matplotlib_font,
-    detect_region, slug as _slug,
-    load_gj, fetch_boundary_osm,
-    DATA_SOURCE_LABELS, INDEX_HELP, MODE_LABELS,
-    CAPABILITY_MATRIX,
-    save_app_state, load_app_state,
+    slug as _slug,
+    load_gj,
+    DATA_SOURCE_LABELS, MODE_LABELS,
 )
 from frontend.project_state import ProjectState
+from frontend.components import jobs as jobs_ui
+from frontend.components.sidebar import (
+    data_source_picker, index_picker, month_range, region_picker, year_pair,
+)
 from frontend.components.ui import (
     empty_state,
     page_header,
@@ -64,8 +62,10 @@ setup_matplotlib_font()
 
 
 # =====================================================================
-#  进度系统
+#  后台任务：收集影像 / 运行分析
 # =====================================================================
+
+JOB_COLLECT, JOB_RUN = "cd_collect_job", "cd_run_job"
 
 STEPS_ANALYSIS = [
     ("📂", "加载波段"),
@@ -77,378 +77,144 @@ STEPS_ANALYSIS = [
     ("📋", "输出报告"),
     ("🏁", "完成"),
 ]
+# 流水线进度（%）达到这些值时进入下一步骤
+_STEP_PCT = (10, 20, 35, 55, 70, 80, 95)
 
 
-def _init_progress(n, labels):
-    st.session_state.cd_progress = 0
-    st.session_state.cd_progress_msg = ""
-    st.session_state.cd_progress_start = time.time()
-    st.session_state.cd_progress_n = n
-    st.session_state.cd_progress_labels = labels
-    st.session_state.cd_progress_active = 0
-
-
-def _render_progress(active, msg, elapsed, detail=""):
-    labels = st.session_state.get("cd_progress_labels", [])
-    n = len(labels)
-    if n == 0:
-        return
+def _render_run(job, runner):
+    """分析任务的进度：步骤条 + 进度条。"""
+    active = sum(job.progress >= p for p in _STEP_PCT) if job.state == "running" else 0
     parts = []
-    for i, label in enumerate(labels):
+    for i, (_, label) in enumerate(STEPS_ANALYSIS):
         if i < active:
             parts.append(f"<span style='color:#0a0'>✅{label}</span>")
         elif i == active:
             parts.append(f"<span style='color:#08f;font-weight:bold'>⏳{label}</span>")
         else:
             parts.append(f"<span style='color:#888'>⏹️{label}</span>")
-    step_bar = " &nbsp;→&nbsp; ".join(parts)
-    ts = f"⏱️ {elapsed:.0f}s" if elapsed < 120 else f"⏱️ {elapsed / 60:.1f}min"
-    stat_ph.markdown(
-        f"<div style='font-size:13px'>{step_bar}</div>"
-        f"<div><b>{msg}</b> &nbsp; {ts}"
-        f"{' &nbsp;—&nbsp; ' + detail if detail else ''}</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"<div style='font-size:13px'>{' &nbsp;→&nbsp; '.join(parts)}</div>",
+                unsafe_allow_html=True)
+    jobs_ui.render_job(job, runner)
 
 
-def _advance_step(idx, msg, pct, detail=""):
-    st.session_state.cd_progress = int(pct)
-    st.session_state.cd_progress_msg = msg
-    st.session_state.cd_progress_active = idx
-    elapsed = time.time() - st.session_state.get("cd_progress_start", time.time())
-    _render_progress(idx, msg, elapsed, detail)
+def _base_params(y1, y2, ms, me, data_src, idx_type, **extra):
+    """由界面取值构造 RunParams（只读 config 默认值，不修改 config）。
+
+    云量阈值取项目设置，与地物分类 / 时间序列一致，单期缓存才能互相命中。
+    """
+    extra.setdefault("max_cloud_pct", ProjectState.get().max_cloud_pct)
+    return RunParams.from_config(
+        region=st.session_state.cd_region or "未知",
+        boundary_file=st.session_state.cd_boundary,
+        year1=int(y1), year2=int(y2), month_start=int(ms), month_end=int(me),
+        data_source=data_src, index_type=idx_type, **extra)
 
 
-def _cb_auto(msg, pct):
-    st.session_state.cd_progress = int(pct)
-    st.session_state.cd_progress_msg = msg
-    elapsed = time.time() - st.session_state.get("cd_progress_start", time.time())
-    prog_bar.progress(int(pct) / 100.0)
-    labels = st.session_state.get("cd_progress_labels", [])
-    if pct < 10:
-        active = 0
-    elif pct < 20:
-        active = 1
-    elif pct < 35:
-        active = 2
-    elif pct < 55:
-        active = 3
-    elif pct < 70:
-        active = 4
-    elif pct < 80:
-        active = 5
-    elif pct < 95:
-        active = 6
-    else:
-        active = min(len(labels) - 1, 7)
-    st.session_state.cd_progress_active = active
-    _render_progress(active, msg, elapsed)
+def _region_slug():
+    return st.session_state.cd_slug or _slug(st.session_state.cd_region or "未知")
 
 
-# =====================================================================
-#  v3 数据收集
-# =====================================================================
+def _boundary_file():
+    return str(Path(st.session_state.cd_boundary).resolve())
 
-def _collect_data(y1, y2, ms, me, data_src, idx_type):
-    """使用 v3 数据源工厂收集影像。"""
-    st.session_state.cd_collecting = True
-    st.session_state.cd_data_ok = False
 
-    stat_ph.info("⏳ 初始化...")
-    prog_bar.progress(0)
+def _job_meta():
+    """任务中心据此显示区域、跳回本页，并判断重试结果能否交回本页。"""
+    return {"page": "pages/01_变化检测.py", "region": st.session_state.cd_region,
+            "boundary": _boundary_file()}
 
+
+def _submit_collect(y1, y2, ms, me, data_src, idx_type):
+    """提交「收集影像」任务：检索 + 下载并写入快照缓存，分析阶段以相同参数直接命中缓存。"""
     try:
-        region = st.session_state.cd_region or "未知"
-        slug_name = st.session_state.cd_slug or _slug(region)
+        params = _base_params(y1, y2, ms, me, data_src, idx_type)
+    except ValueError as e:
+        st.error(f"参数无效: {e}")
+        return
 
-        config.REGION_NAME = region
-        config.YEAR1 = int(y1)
-        config.YEAR2 = int(y2)
-        config.MONTH_START = int(ms)
-        config.MONTH_END = int(me)
-        config.DATA_SOURCE = data_src
-        config.INDEX_TYPE = idx_type
-        if st.session_state.cd_boundary:
-            config.BOUNDARY_FILE = st.session_state.cd_boundary
+    ps = ProjectState.get()
+    ps.region, ps.data_source, ps.index_type = params.region, data_src, idx_type
+    ps.year1, ps.year2 = int(y1), int(y2)
+    ProjectState.commit()
 
-        # 同步到 ProjectState
-        ps = ProjectState.get()
-        ps.region = region
-        ps.data_source = data_src
-        ps.index_type = idx_type
-        ps.year1 = int(y1)
-        ps.year2 = int(y2)
-        ProjectState.commit()
-
-        data_dir = str(BASE_DIR / "data" / slug_name)
-        os.makedirs(data_dir, exist_ok=True)
-        boundary = load_gj(st.session_state.cd_boundary)[1]
-
-        # 确定需要的波段
-        needed = get_needed_bands(idx_type)
-        source = get_data_source(data_src)
-
-        label = DATA_SOURCE_LABELS.get(data_src, data_src)
-        info_msg = st.empty()
-
-        # === Y1 ===
-        info_msg.info(f"🔍 搜索 {y1} 年 {label} 影像 ({idx_type} 需要 {needed})...")
-        s1 = source.search_scenes(boundary, y1, ms, me, config.MAX_CLOUD_PCT)
-        if not s1:
-            raise RuntimeError(f"{y1} 年未找到可用 {data_src} 影像")
-
-        info_msg.info(f"📥 下载 {y1} 年影像 ({len(s1)} 瓦片, {len(needed)} 波段)...")
-        b1 = source.download_bands(s1, data_dir, needed)
-        m1 = sum(os.path.getsize(p) for p in b1.values() if os.path.exists(p)) / 1024 / 1024
-        info_msg.success(f"✅ {y1} 年完成 ({m1:.0f} MB)")
-
-        # === Y2 ===
-        info_msg.info(f"🔍 搜索 {y2} 年 {label} 影像 ...")
-        s2 = source.search_scenes(boundary, y2, ms, me, config.MAX_CLOUD_PCT)
-        if not s2:
-            raise RuntimeError(f"{y2} 年未找到可用 {data_src} 影像")
-
-        info_msg.info(f"📥 下载 {y2} 年影像 ({len(s2)} 瓦片, {len(needed)} 波段)...")
-        b2 = source.download_bands(s2, data_dir, needed)
-        m2 = sum(os.path.getsize(p) for p in b2.values() if os.path.exists(p)) / 1024 / 1024
-        info_msg.success(f"✅ {y2} 年完成 ({m2:.0f} MB)")
-
-        # 质量波段 (SCL / QA_PIXEL) 供分析阶段做云掩膜
-        info_msg.info("📥 下载质量波段（云掩膜）...")
-        q1 = source.download_quality_bands(s1, data_dir)
-        q2 = source.download_quality_bands(s2, data_dir)
-
-        total_mb = m1 + m2
-
-        # —— 登记到 SnapshotCache，避免后续分析重复下载 ——
-        try:
-            from engine.cache import SnapshotCache, compute_aoi_hash, snapshot_key
-            from engine.preprocessing import PREPROCESSING_VERSION
-            sc = SnapshotCache(cache_root=str(BASE_DIR / "data" / "cache"))
-            aoi_hash = compute_aoi_hash(boundary)
-            new_key = snapshot_key(
-                aoi_hash, data_src, idx_type, y1, y2, ms, me,
-                config.MAX_CLOUD_PCT, needed, PREPROCESSING_VERSION)
-            if not sc.has(new_key):
-                snap_dict = {
-                    "region": region, "aoi_hash": aoi_hash,
-                    "data_source": data_src, "index_type": idx_type,
-                    "year1": int(y1), "year2": int(y2),
-                    "month_start": int(ms), "month_end": int(me),
-                    "max_cloud_pct": config.MAX_CLOUD_PCT,
-                    "bands": list(needed), "tile_ids": [],
-                    "preprocessing_version": PREPROCESSING_VERSION,
-                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                sc.put_snapshot(new_key, snap_dict)
-                import shutil
-                cache_dir = sc.get_band_dir(new_key)
-                for fpath in (list(b1.values()) + list(b2.values())
-                              + list(q1.values()) + list(q2.values())):
-                    if os.path.exists(fpath):
-                        shutil.copy2(fpath, cache_dir)
-                sc.mark_complete(new_key)
-        except Exception as e:
-            log(f"  Cache registration skipped: {e}")
-
-        st.session_state.cd_collected = {
-            "context": {
-                "region": region, "year1": y1, "year2": y2,
-                "data_source": data_src, "index_type": idx_type,
-                "tiles_found": len(s1) + len(s2),
-                "bands": needed, "size_mb": total_mb,
-            }
-        }
-        st.session_state.cd_data_ok = True
-        info_msg.success(f"✅ {region} 资料收集完成 ({total_mb:.0f} MB)")
-
-    except Exception as e:
-        st.error(f"❌ 资料收集失败: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-    finally:
-        st.session_state.cd_collecting = False
+    S.cd_data_ok, S.cd_collected = False, None
+    label = DATA_SOURCE_LABELS.get(data_src, data_src)
+    jobs_ui.submit(JOB_COLLECT, "cd.collect", {
+        "run_params": params.to_dict(),
+        "boundary_file": _boundary_file(),
+        "data_dir": str(BASE_DIR / "data" / _region_slug()),
+    }, title=f"{params.region} · {y1}/{y2} 年 {label} 影像（{idx_type}）", meta=_job_meta())
+    _save_state()
+    st.rerun()
 
 
-def _check_cache(slug_name, y1, y2, idx_type):
-    """检查缓存是否满足指数需求。"""
-    data_dir = BASE_DIR / "data" / slug_name
-    if not data_dir.exists():
-        return False, []
-    needed = get_needed_bands(idx_type)
-    from engine.data_sources import Sentinel2DataSource
-    s2 = Sentinel2DataSource()
-    existing = set(os.listdir(str(data_dir)))
-    missing = []
-    for band in needed:
-        fname = s2.FILE_NAME_MAP.get(band, band.upper())
-        f1 = f"{fname}_{y1}.tif"
-        f2 = f"{fname}_{y2}.tif"
-        if f1 not in existing:
-            missing.append(f1)
-        if f2 not in existing:
-            missing.append(f2)
-    return len(missing) == 0, missing
+def _apply_collect(ctx):
+    S.cd_collected = {"context": ctx}
+    S.cd_data_ok = True
+    return f"{ctx['region']} · {ctx['size_mb']:.0f} MB，可进入“运行分析”执行变化检测。"
 
 
-# =====================================================================
-#  v3 分析运行
-# =====================================================================
+def _check_cache(y1, y2, ms, me, data_src, idx_type):
+    """检查快照缓存是否已有与当前参数（区域/数据源/时相/月份/云量/波段）匹配的数据。
 
-def _run_analysis(y1, y2, ms, me, dmode, ct, sthr, ma, bf,
-                  strat, np_pts, md_pts, greport,
-                  idx_type, data_src):
-    """v3 分析流水线。"""
-    st.session_state.cd_running = True
-    labels = [s[1] for s in STEPS_ANALYSIS]
-    _init_progress(len(labels), labels)
-    stat_ph.info("⏳ 初始化分析...")
-    prog_bar.progress(0)
-
+    Returns:
+        缓存信息 dict(key, size_mb, tiles)，未命中返回 None。
+    """
+    bnd = st.session_state.cd_boundary
+    if not bnd or not Path(bnd).exists():
+        return None
     try:
-        region = st.session_state.cd_region or "未知"
-        slug_name = st.session_state.cd_slug or _slug(region)
+        params = _base_params(y1, y2, ms, me, data_src, idx_type)
+        return find_cached_snapshot(params, load_gj(bnd)[1])
+    except Exception:
+        return None
 
-        config.REGION_NAME = region
-        config.YEAR1 = int(y1)
-        config.YEAR2 = int(y2)
-        config.MONTH_START = int(ms)
-        config.MONTH_END = int(me)
-        config.DETECTION_MODE = dmode
-        config.CHANGE_THRESHOLD = ct
-        config.SEVERE_THRESHOLD = sthr
-        config.MORPH_KERNEL_SIZE = 4
-        config.MIN_CHANGE_AREA_M2 = int(ma)
-        config.MIN_CHANGE_AREA_PX = max(1, int(ma) // 100)
-        config.USE_BILATERAL_FILTER = bf
-        config.SAMPLE_STRATEGY = strat
-        config.NUM_SAMPLE_POINTS = int(np_pts) if int(np_pts) > 0 else None
-        config.MIN_POINT_DISTANCE_M = int(md_pts) if int(md_pts) > 0 else None
-        config.OUTPUT_FORMATS = "geojson,csv"
-        config.GENERATE_REPORT = greport
-        config.INDEX_TYPE = idx_type
-        config.DATA_SOURCE = data_src
-        if st.session_state.cd_boundary:
-            config.BOUNDARY_FILE = st.session_state.cd_boundary
 
-        region_data_dir = str(BASE_DIR / "data" / slug_name)
-        region_out_dir = str(BASE_DIR / "output" / slug_name)
-        os.makedirs(region_out_dir, exist_ok=True)
+def _submit_run(y1, y2, ms, me, dmode, ct, sthr, ma, bf,
+                np_pts, md_pts, greport, idx_type, data_src):
+    """提交分析任务（参数通过 RunParams 显式传入，不修改全局 config）。"""
+    try:
+        params = _base_params(
+            y1, y2, ms, me, data_src, idx_type,
+            detection_mode=dmode, threshold=ct, severe_threshold=sthr,
+            min_area_m2=ma, use_bilateral_filter=bf,
+            num_sample_points=int(np_pts) if int(np_pts) > 0 else None,
+            min_point_distance_m=int(md_pts) if int(md_pts) > 0 else None,
+            output_formats=("geojson", "csv"), generate_report=greport)
+    except ValueError as e:
+        st.error(f"参数无效: {e}")
+        return
 
-        res = run_pipeline_v3(
-            data_source_name=data_src,
-            data_dir=region_data_dir,
-            out_dir=region_out_dir,
-            index_type=idx_type,
-            detection_mode=dmode,
-            threshold=ct,
-            severe_threshold=sthr,
-            min_area_m2=ma,
-            progress_callback=_cb_auto,
-        )
+    slug_name = _region_slug()
+    jobs_ui.submit(JOB_RUN, "cd.run", {
+        "run_params": params.to_dict(),
+        "boundary_file": _boundary_file(),
+        "data_dir": str(BASE_DIR / "data" / slug_name),
+        "out_dir": str(BASE_DIR / "output" / slug_name),
+        "slug": slug_name,
+        "source_label": DATA_SOURCE_LABELS.get(data_src, data_src),
+        "pdf": bool(S.get("cd_gen_pdf", True)),
+    }, title=f"{params.region} · {idx_type} 变化检测 {y1}→{y2}", meta=_job_meta())
+    _save_state()
+    st.rerun()
 
-        # —— P0-7 修复：检查错误返回 ——
-        if "error" in res:
-            st.error(f"❌ 分析失败: {res['error']}")
-            st.session_state.cd_running = False
-            return
 
-        st.session_state.cd_results = res
-        st.session_state.cd_stats = res.get("stats")
-
-        unmasked = [k for k, v in res.get("preprocessing", {}).items()
-                    if not v.get("cloud_mask")]
-        if unmasked:
-            years = "、".join(str(y1 if k == "y1" else y2) for k in unmasked)
-            st.warning(f"⚠️ {years} 年缺少质量波段，未做云掩膜，云区可能被误判为变化。")
-
-        # 加载 GeoTIFF 结果用于地图
-        gtif = res.get("files", {}).get("geotiff")
-        if gtif and os.path.exists(gtif):
-            with rasterio.open(gtif) as src:
-                st.session_state.cd_arr = src.read(1)
-                st.session_state.cd_meta = src.meta
-
-        # 加载采样点
-        gjp = res.get("files", {}).get("geojson")
-        if gjp and os.path.exists(gjp):
-            with open(gjp, encoding="utf-8") as f:
-                st.session_state.cd_cands = json.load(f).get("features", [])
-
-        timing = res.get("timing", {}).get("total", 0)
-        st.session_state.cd_analysis_done = True
-
-        # —— 记录任务到 ProjectState ——
-        try:
-            from frontend.project_state import ProjectState
-            s = res.get("stats", {})
-            ah = (s.get("changed_total", {}).get("area_ha")
-                  or s.get("changed_area_ha", 0))
-            task_record = {
-                "id": f"cd_{slug_name}_{y1}_{y2}_{idx_type}",
-                "mode": "change_detection",
-                "region": region,
-                "data_source": data_src,
-                "index_type": idx_type,
-                "year1": int(y1), "year2": int(y2),
-                "status": "success",
-                "started_at": st.session_state.get("cd_progress_start", ""),
-                "duration_s": round(timing, 1),
-                "stats_summary": f"变化 {ah:,.0f} ha" if ah else "完成",
-                "output_files": res.get("files", {}),
-            }
-            ProjectState.add_task(task_record)
-        except Exception:
-            pass
-
-        # —— 自动生成 PDF 报告（根据 checkbox 设置）——
-        if st.session_state.get("cd_gen_pdf", True):
-            try:
-                from engine.report_generator import generate_report_pdf
-                meta_pdf = {
-                    "region": region,
-                    "year1": config.YEAR1,
-                    "year2": config.YEAR2,
-                    "index_type": idx_type,
-                    "data_source": DATA_SOURCE_LABELS.get(data_src, data_src),
-                    "threshold": ct,
-                    "detection_mode": dmode,
-                }
-                report_image = res.get("files", {}).get("report", "")
-                sample_pts = None
-                if st.session_state.cd_cands:
-                    sample_pts = [
-                        {"lon": f["geometry"]["coordinates"][0],
-                         "lat": f["geometry"]["coordinates"][1],
-                         "class_name": f["properties"].get("class_name", "")}
-                        for f in st.session_state.cd_cands[:50]
-                    ]
-                pdf_path = generate_report_pdf(
-                    stats=res.get("stats", {}),
-                    report_image=report_image,
-                    sample_points=sample_pts,
-                    boundary_info={"area_km2": ""},
-                    metadata=meta_pdf,
-                    output_dir=region_out_dir,
-                )
-                if pdf_path and os.path.exists(pdf_path):
-                    res["files"]["pdf"] = pdf_path
-            except Exception as e:
-                print(f"  PDF auto-generation skipped: {e}")
-
-        idx_label = idx_type
-        st.success(
-            f"✅ {region} · {idx_label} · {data_src} · "
-            f"{y1}→{y2}  分析完成！耗时 {timing:.0f}s"
-        )
-        _save_state()
-
-    except Exception as e:
-        st.error(f"❌ 分析失败: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-    finally:
-        st.session_state.cd_running = False
+def _apply_run(res):
+    S.cd_results = res
+    S.cd_stats = res.get("stats")
+    S.cd_arr, S.cd_meta, S.cd_cands = cd_svc.load_outputs(res)
+    S.cd_analysis_done = True
+    try:
+        ProjectState.add_task(res["task"])
+    except Exception:
+        pass
+    if res.get("unmasked_years"):
+        years = "、".join(map(str, res["unmasked_years"]))
+        return ("warning", "变化检测完成，部分年份未做云掩膜",
+                f"{years} 年缺少质量波段，云区可能被误判为变化。")
+    return (f"{res.get('region', '')} · {res.get('index_type', '')} · "
+            f"{res.get('year1')}→{res.get('year2')} · "
+            f"耗时 {res.get('timing', {}).get('total', 0):.0f}s")
 
 
 # =====================================================================
@@ -468,7 +234,7 @@ def _show_map():
         add_boundary_layer, legend_html,
     )
 
-    idx = getattr(config, "INDEX_TYPE", "NDVI")
+    idx = (st.session_state.cd_results or {}).get("index_type", "NDVI")
     meta = st.session_state.cd_meta
 
     # 透明度控制
@@ -489,10 +255,15 @@ def _show_map():
     Fullscreen().add_to(m)
     add_boundary_layer(m, gj)
 
-    # 使用透明度参数
-    from frontend.components.map_view import add_change_result_layer as _add_layer
-    _add_layer(m, st.session_state.cd_arr, meta,
-               index_type=idx, opacity=map_opacity)
+    # 叠加图按结果文件缓存：拖动透明度 / 点击地图不再重算
+    from frontend.components.map_view import (
+        add_change_result_layer as _add_layer, cached_change_overlays,
+    )
+    gtif = (st.session_state.cd_results or {}).get("files", {}).get("geotiff", "")
+    mtime = os.path.getmtime(gtif) if gtif and os.path.exists(gtif) else id(st.session_state.cd_arr)
+    overlays = cached_change_overlays(
+        st.session_state, (gtif, mtime, idx), st.session_state.cd_arr, meta, idx)
+    _add_layer(m, index_type=idx, opacity=map_opacity, overlays=overlays)
 
     # 底图切换
     folium.TileLayer("OpenStreetMap", name="街道图", show=False).add_to(m)
@@ -505,6 +276,9 @@ def _show_map():
     folium.LayerControl(collapsed=False).add_to(m)
     m.get_root().html.add_child(folium.Element(legend_html(idx)))
     output = st_folium(m, width=None, height=600, key="change_result_map")
+    if overlays:
+        st.caption("点击地图查看该处像元类别 · 图层包含全部变化像元（"
+                   + "、".join(f"{o['name']} {o['pixels']:,}" for o in overlays) + "）")
 
     # ---- 点击交互：显示像元信息 ----
     clicked = output.get("last_clicked")
@@ -543,10 +317,11 @@ def _show_map():
 
 def _show_stats():
     s = st.session_state.cd_stats
-    idx = getattr(config, "INDEX_TYPE", "NDVI")
-    dmode = config.DETECTION_MODE
+    res = st.session_state.cd_results or {}
+    idx = res.get("index_type", "NDVI")
+    dmode = res.get("detection_mode", "multi")
 
-    if dmode != "multi":
+    if dmode == "binary":
         st.metric("变化面积", f"{s.get('changed_area_ha', 0):,.0f} ha")
         return
 
@@ -588,7 +363,7 @@ def _show_stats():
         t = s["changed_total"]
         status_banner(
             "info", "变化检测摘要",
-            f"{config.REGION_NAME} · {config.YEAR1}-{config.YEAR2} · "
+            f"{res.get('region', '')} · {res.get('year1')}-{res.get('year2')} · "
             f"{idx} 显著变化 {t['area_ha']:,.0f} ha ({t['percent']:.1f}%)",
         )
 
@@ -600,13 +375,14 @@ def _show_stats():
                 scale = max(1, min(h, w) // 400)
                 small = arr[::scale, ::scale]
 
-                from engine.core import _get_change_mask_multi
-                chg = _get_change_mask_multi(small)
+                chg = np.isin(small, [-3, -2, 2, 3])
                 cls_small = small.copy()
                 cls_small[cls_small == 0] = 5  # no-data
 
-                colors_rgb = { -3: (180,0,0), -2: (255,100,0), 1: (40,40,40),
-                               2: (0,180,80), 3: (0,80,0), 5: (10,10,10) }
+                def _rgb(hx):
+                    return tuple(int(hx[i:i + 2], 16) for i in (1, 3, 5))
+                colors_rgb = {cv: _rgb(c) for cv, c in cls_c.items()}
+                colors_rgb[5] = (10, 10, 10)
                 rgb = np.zeros((*cls_small.shape, 3), dtype=np.uint8)
                 for cv, c in colors_rgb.items():
                     rgb[cls_small == cv] = c
@@ -626,13 +402,12 @@ def _show_stats():
                 axes2[2].axis("off")
                 from matplotlib.patches import Patch as MPatch
                 patches_val = [
-                    MPatch(color="#b40000", label=f"严重退化 {s.get(-3,{}).get('area_ha',0):.0f}ha"),
-                    MPatch(color="#ff6400", label=f"中度退化 {s.get(-2,{}).get('area_ha',0):.0f}ha"),
-                    MPatch(color="#282828", label=f"稳定"),
-                    MPatch(color="#00b450", label=f"中度恢复 {s.get(2,{}).get('area_ha',0):.0f}ha"),
-                    MPatch(color="#005000", label=f"强烈恢复 {s.get(3,{}).get('area_ha',0):.0f}ha"),
-                    MPatch(color="#ff3c3c", label=f"变化合计 {s.get('changed_total',{}).get('area_ha',0):.0f}ha"),
-                ]
+                    MPatch(color=cls_c[cv], label=(
+                        cls_n[cv] if cv == 1 else
+                        f"{cls_n[cv]} {s.get(cv, {}).get('area_ha', 0):.0f}ha"))
+                    for cv in [-3, -2, 1, 2, 3]
+                ] + [MPatch(color="#ff3c3c",
+                            label=f"变化合计 {s.get('changed_total', {}).get('area_ha', 0):.0f}ha")]
                 axes2[2].legend(handles=patches_val, loc="center", fontsize=11,
                                 facecolor="#FFFFFF", labelcolor="#18221D")
                 axes2[2].set_title("图例", fontsize=13, color="#18221D")
@@ -658,7 +433,7 @@ def _show_points():
     } for f in st.session_state.cd_cands]
     df = pd.DataFrame(rows)
     section_header(f"采样点 · {len(rows)}", "候选斑块中心点与类别属性。")
-    st.dataframe(df, use_container_width=True, height=400)
+    st.dataframe(df, height=400)
     buf = io.BytesIO()
     df.to_csv(buf, index=False, encoding="utf-8-sig")
     st.download_button(
@@ -675,28 +450,20 @@ def _show_points():
 
 S = st.session_state
 
-# 从 ProjectState 初始化
+# 分析区域以项目为准（任何页面的侧栏或向导切换区域都写入项目状态）
 ps = ProjectState.get()
-if ps.is_ready():
-    S.setdefault("cd_boundary", ps.boundary)
-    S.setdefault("cd_region", ps.region)
-    S.setdefault("cd_slug", ps.slug)
+S.cd_boundary, S.cd_region, S.cd_slug = ps.boundary or None, ps.region or None, ps.slug or None
 
 _INIT = {
-    "cd_boundary": None,
-    "cd_region": None,
-    "cd_slug": None,
     "cd_data_ok": False,
-    "cd_collecting": False,
-    "cd_running": False,
     "cd_collected": None,
+    JOB_COLLECT: None,
+    JOB_RUN: None,
     "cd_results": None,
     "cd_arr": None,
     "cd_meta": None,
     "cd_stats": None,
     "cd_cands": None,
-    "cd_progress": 0,
-    "cd_progress_msg": "",
     "cd_analysis_done": False,
     "cd_map_opacity": 0.6,
 }
@@ -704,25 +471,29 @@ for k, v in _INIT.items():
     if k not in S:
         S[k] = v
 
-# ---- 状态持久化 ----
-STATE_FILE = BASE_DIR / ".app_state.json"
+# 区域换了：清掉属于旧区域的影像状态与结果，不再跟踪旧区域的任务（任务照常运行，结果在任务中心）
+if ProjectState.aoi_changed("cd"):
+    for k, v in _INIT.items():
+        if k != "cd_map_opacity":
+            S[k] = v
+    jobs_ui.forget(JOB_COLLECT, JOB_RUN)
+
+# ---- 状态持久化：项目状态的 cd 节（含正在跟踪的任务：刷新浏览器后继续显示进度并取回结果）----
+_PERSIST = ["cd_data_ok", "cd_collected", JOB_COLLECT, JOB_RUN]
 
 def _save_state():
-    state = {
-        "cd_boundary": S.get("cd_boundary"),
-        "cd_region": S.get("cd_region"),
-        "cd_slug": S.get("cd_slug"),
-        "cd_data_ok": S.get("cd_data_ok", False),
-        "cd_collected": S.get("cd_collected"),
-    }
-    save_app_state(STATE_FILE, state)
+    ProjectState.save_page("cd", {k: S.get(k) for k in _PERSIST})
 
 def _load_state():
-    loaded = load_app_state(STATE_FILE, ["cd_boundary", "cd_region", "cd_slug", "cd_data_ok", "cd_collected"])
-    for k, v in loaded.items():
+    for k, v in ProjectState.load_page("cd", _PERSIST).items():
         S[k] = v
 
 _load_state()
+
+# 已结束的后台任务：结果写入会话状态
+collecting = jobs_ui.settle(JOB_COLLECT, label="影像收集", on_success=_apply_collect,
+                            persist=_save_state)
+running = jobs_ui.settle(JOB_RUN, label="变化检测", on_success=_apply_run, persist=_save_state)
 
 # =====================================================================
 #  Sidebar 参数面板
@@ -730,102 +501,20 @@ _load_state()
 
 sidebar_header("变化检测参数", "分析范围、时相与检测阈值")
 
-# --- 地区选择 ---
-st.sidebar.subheader("分析区域")
-exist = {f.name: str(f) for f in BASE_DIR.glob("*.geojson")}
-cur_name = Path(S.cd_boundary).name if S.cd_boundary else None
-if exist:
-    sel_name = st.sidebar.selectbox(
-        "已有边界文件",
-        list(exist.keys()),
-        index=list(exist.keys()).index(cur_name) if cur_name in exist else 0,
-    )
-    chosen = exist[sel_name]
-    if chosen != S.cd_boundary:
-        S.cd_boundary = chosen
-        r = detect_region(chosen)
-        S.cd_region = r
-        S.cd_slug = _slug(r)
-        S.cd_data_ok = False
-        S.cd_collected = None
-        ProjectState.set_aoi(r, chosen)
-        _save_state()
-        st.rerun()
 
-search_name = st.sidebar.text_input("搜索地区", "", placeholder="城市/区县名")
-if st.sidebar.button("获取边界", icon=":material/search:", use_container_width=True,
-                      disabled=not search_name.strip()):
-    with st.sidebar.status(f"正在搜索 {search_name}..."):
-        gj, err = fetch_boundary_osm(search_name.strip())
-        if err:
-            st.sidebar.error(err)
-        else:
-            fp = BASE_DIR / f"{_slug(search_name)}.geojson"
-            with open(fp, "w", encoding="utf-8") as f:
-                json.dump(gj, f, ensure_ascii=False)
-            S.cd_boundary = str(fp)
-            S.cd_region = search_name.strip()
-            S.cd_slug = _slug(search_name)
-            S.cd_data_ok = False
-            S.cd_collected = None
-            ProjectState.set_aoi(S.cd_region, S.cd_boundary, S.cd_slug)
-            _save_state()
-            st.rerun()
-
-if S.cd_boundary and Path(S.cd_boundary).exists():
-    try:
-        _, geom = load_gj(S.cd_boundary)
-        # 将面积从度²转为 km²（粗略估算：1° ≈ 111 km）
-        area_deg2 = geom.area
-        area_km2 = area_deg2 * (111.32 ** 2)
-        st.sidebar.caption(
-            f"中心: {geom.centroid.y:.3f}, {geom.centroid.x:.3f}  "
-            f"面积: {area_km2:.1f} km²"
-        )
-    except Exception:
-        st.sidebar.error("边界解析失败")
-else:
-    st.sidebar.error("请选择边界文件")
-
+region_picker("cd")
 st.sidebar.markdown("---")
 
-# --- 时相 ---
 st.sidebar.subheader("时间范围")
-y1 = st.sidebar.number_input("前时相年份", 2015, 2027, config.YEAR1, 1)
-y2 = st.sidebar.number_input("后时相年份", 2015, 2027, config.YEAR2, 1)
-ms = st.sidebar.slider("起始月份", 1, 12, config.MONTH_START)
-me = st.sidebar.slider("结束月份", 1, 12, config.MONTH_END)
+# 默认值：本会话 ProjectState（向导/上次选择）> config
+y1, y2 = year_pair(ps.year1 or config.YEAR1, ps.year2 or config.YEAR2)
+ms, me = month_range(ps.month_start or config.MONTH_START, ps.month_end or config.MONTH_END)
+period_ok = y1 != y2 and ms <= me
 st.sidebar.markdown("---")
 
-# --- 数据源与指数 ---
 st.sidebar.subheader("数据源与指数")
-
-# 能力矩阵：根据数据源限制可用指数
-all_sources = ["sentinel2", "landsat8", "landsat9", "sentinel1"]
-data_src = st.sidebar.selectbox(
-    "数据源",
-    all_sources,
-    format_func=lambda x: DATA_SOURCE_LABELS.get(x, x),
-    help="sentinel2: 10m 多光谱 | landsat: 30m | sentinel1: SAR雷达（不支持光学指数）"
-)
-
-# 根据能力矩阵过滤可用指数
-available_indices = CAPABILITY_MATRIX.get(data_src, ["NDVI", "NDWI", "MNDWI", "NBR", "EVI", "SAVI"])
-if not available_indices:
-    st.sidebar.warning("⚠️ 该数据源暂不支持光谱指数。请切换至 Sentinel-2 或 Landsat。")
-    available_indices = ["—"]
-
-# 初始化/保留 idx_type
-cur_idx = st.session_state.get("cd_cur_idx", "NDVI")
-cur_idx = cur_idx if cur_idx in available_indices else available_indices[0]
-
-idx_type = st.sidebar.selectbox(
-    "遥感指数",
-    available_indices,
-    index=available_indices.index(cur_idx) if cur_idx in available_indices else 0,
-    format_func=lambda x: f"{x} ({INDEX_HELP.get(x, '')})" if x != "—" else "（无可用指数）",
-)
-st.session_state.cd_cur_idx = idx_type
+data_src = data_source_picker(ps.data_source)
+idx_type = index_picker(data_src, default=ps.index_type or "NDVI", remember_as="cd_cur_idx")
 st.sidebar.markdown("---")
 
 # --- 检测参数 ---
@@ -871,12 +560,9 @@ with st.sidebar.expander("检测参数", expanded=True):
     bf = st.checkbox("双边预滤波", config.USE_BILATERAL_FILTER)
 
 with st.sidebar.expander("采样设置"):
-    strat = st.selectbox(
-        "策略", ["centroid", "random", "grid"],
-        format_func=lambda x: {"centroid": "质心", "random": "随机", "grid": "网格"}[x],
-    )
+    st.caption("每个变化斑块取一个内部代表点，按面积从大到小保留。")
     np_pts = st.number_input("上限 (0=不限)", 0, 100000, 0)
-    md_pts = st.number_input("间距 (m)", 0, 10000, 0)
+    md_pts = st.number_input("最小间距 (m, 0=不限)", 0, 10000, 0)
 
 with st.sidebar.expander("输出设置"):
     greport = st.checkbox("报告 PNG", True)
@@ -888,7 +574,8 @@ with st.sidebar.expander("输出设置"):
 # =====================================================================
 
 wizard_key = "_cd_wizard_active"
-if not S.cd_data_ok and not S.cd_results and not S.get(wizard_key, False):
+if (not S.cd_data_ok and not S.cd_results and not collecting and not running
+        and not S.get(wizard_key, False)):
     from frontend.components.wizard import render_wizard
     wizard_done = render_wizard()
     if wizard_done:
@@ -915,8 +602,10 @@ page_header(
         "指数": idx_type,
         "阈值": f"±{ct}",
     },
-    status=("分析完成" if S.cd_results else "数据已就绪" if S.cd_data_ok else "等待数据"),
-    status_tone=("success" if S.cd_results else "info" if S.cd_data_ok else "warning"),
+    status=("正在分析" if running else "正在收集影像" if collecting
+            else "分析完成" if S.cd_results else "数据已就绪" if S.cd_data_ok else "等待数据"),
+    status_tone=("info" if running or collecting
+                 else "success" if S.cd_results else "info" if S.cd_data_ok else "warning"),
 )
 
 workflow_bar(
@@ -925,8 +614,9 @@ workflow_bar(
     completed=[0, 1] if S.cd_results else [0] if S.cd_data_ok else [],
 )
 
-stat_ph = st.empty()
-prog_bar = st.progress(0)
+# 任务进度（后台执行：可切换页面或关闭浏览器，回来后继续显示）/ 上一次任务的结果提示
+jobs_ui.progress(JOB_COLLECT)
+jobs_ui.progress(JOB_RUN, render=_render_run)
 
 tab_dl, tab_run, tab_map, tab_stat, tab_pt = st.tabs(
     ["影像数据", "运行分析", "结果地图", "统计摘要", "采样点"]
@@ -939,12 +629,13 @@ tab_dl, tab_run, tab_map, tab_stat, tab_pt = st.tabs(
 with tab_dl:
     section_header("准备遥感影像", "检查本地缓存，按需检索并下载所需波段。", "阶段 01")
 
-    can_collect = bool(S.cd_boundary) and Path(S.cd_boundary).exists() and not S.cd_collecting
+    can_collect = (bool(S.cd_boundary) and Path(S.cd_boundary).exists()
+                   and period_ok and not collecting)
     band_str = ", ".join(get_needed_bands(idx_type))
     btn_label = f"收集 {y1} / {y2} 影像 · {idx_type}"
-    if st.button(btn_label, type="primary", icon=":material/download:", use_container_width=True,
+    if st.button(btn_label, type="primary", icon=":material/download:", width="stretch",
                   disabled=not can_collect):
-        _collect_data(y1, y2, ms, me, data_src, idx_type)
+        _submit_collect(y1, y2, ms, me, data_src, idx_type)
 
     if S.cd_data_ok:
         info = S.cd_collected or {}
@@ -972,25 +663,18 @@ with tab_dl:
                 st_folium(m, width="100%", height=350)
             except Exception:
                 pass
-    elif S.cd_collecting:
-        status_banner("info", "正在收集影像", "检索、下载与波段裁剪正在进行。")
+    elif collecting:
+        status_banner("info", "正在收集影像",
+                      "检索、下载与波段裁剪在后台进行，进度见页面上方；可先切换到其他页面。")
     else:
         # 检查缓存
-        cache_slug = S.cd_slug or _slug(S.cd_region or "")
-        cached_ok, missing = _check_cache(cache_slug, y1, y2, idx_type)
-        if cached_ok:
-            data_dir = BASE_DIR / "data" / cache_slug
-            mb = sum(f.stat().st_size for f in data_dir.iterdir()
-                     if f.suffix == ".tif") / 1024 / 1024
-            status_banner("success", "检测到完整本地缓存", f"data/{cache_slug}/ · {mb:.0f} MB")
-        elif missing:
-            status_banner(
-                "warning",
-                f"缺少 {len(missing)} 个波段文件",
-                f"{src_label} · {idx_type} · 需要 {band_str}",
-            )
+        cached = _check_cache(y1, y2, ms, me, data_src, idx_type)
+        if cached:
+            status_banner("success", "检测到匹配的本地缓存",
+                          f"{cached['key'][:8]}… · {cached['size_mb']:.0f} MB")
         else:
-            status_banner("info", "尚未收集影像", f"{src_label} · {idx_type}")
+            status_banner("info", "尚未收集影像",
+                          f"{src_label} · {idx_type} · 需要 {band_str}")
 
         if S.cd_boundary and Path(S.cd_boundary).exists():
             try:
@@ -1017,27 +701,22 @@ with tab_run:
     # 检查数据是否就绪
     ready = S.cd_data_ok
     if not ready:
-        slug_name = S.cd_slug or _slug(S.cd_region or "default")
-        cached_ok, _ = _check_cache(slug_name, y1, y2, idx_type)
-        if cached_ok:
-            data_dir = BASE_DIR / "data" / slug_name
-            mb = sum((data_dir / f).stat().st_size for f in os.listdir(str(data_dir))
-                     if f.endswith(".tif")) / 1024 / 1024
-            status_banner("success", "检测到可用缓存", f"{mb:.0f} MB · 可直接运行")
+        cached = _check_cache(y1, y2, ms, me, data_src, idx_type)
+        if cached:
+            status_banner("success", "检测到可用缓存", f"{cached['size_mb']:.0f} MB · 可直接运行")
             ready = True
         else:
             status_banner("warning", "影像数据未就绪", "请先在“影像数据”中完成收集。")
 
-    can_run = ready and not S.cd_running
+    can_run = ready and period_ok and not running and not collecting
     btn_run = st.button(
         f"运行 {idx_type} 变化检测",
         type="primary", icon=":material/play_arrow:",
-        use_container_width=True, disabled=not can_run,
+        width="stretch", disabled=not can_run,
     )
     if btn_run:
-        _run_analysis(y1, y2, ms, me, dmode, ct, sthr, ma, bf,
-                      strat, np_pts, md_pts, greport,
-                      idx_type, data_src)
+        _submit_run(y1, y2, ms, me, dmode, ct, sthr, ma, bf,
+                    np_pts, md_pts, greport, idx_type, data_src)
 
     if S.cd_results:
         section_header("分析结果", "本次执行的核心指标与输出文件。", "完成")
@@ -1046,10 +725,7 @@ with tab_run:
         with a:
             st.metric("采样点", res.get("num_sample_points", 0))
         with b:
-            s = res.get("stats", {})
-            ah = (s.get("changed_total", {}).get("area_ha")
-                  or s.get("changed_area_ha", 0))
-            st.metric("变化面积", f"{ah:,.0f} ha")
+            st.metric("变化面积", f"{cd_svc.changed_area_ha(res.get('stats', {})):,.0f} ha")
         with c:
             st.metric("耗时", f"{res.get('timing', {}).get('total', 0):.0f}s")
         with d:
@@ -1082,7 +758,7 @@ with tab_run:
                     st.download_button(
                         "下载 PDF 报告", fh.read(),
                         Path(pdf_path).name, "application/pdf",
-                        icon=":material/download:", use_container_width=True)
+                        icon=":material/download:", width="stretch")
 
 # =====================================================================
 #  Tab 3-5 — 结果展示

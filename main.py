@@ -6,36 +6,17 @@
 或作为模块导入: from main import run_pipeline, run_pipeline_v3
 """
 
+import argparse
 import os
 import sys
-import json
 import warnings
-import time
-
-import numpy as np
-import rasterio
-from rasterio.mask import mask
-from rasterio.merge import merge
-from rasterio.features import geometry_mask
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-from matplotlib.patches import Patch
-from matplotlib.colors import ListedColormap, BoundaryNorm
-from shapely.geometry import shape, box as sbox, Point, Polygon
-from shapely.ops import transform as shp_transform
-from shapely.prepared import prep
-from pyproj import Transformer
-import cv2
-import pandas as pd
 
 import config
 
 # 从 engine 包导入核心功能
 from engine.utils import (
     log, get_boundary, boundary_pixel_mask,
-    setup_matplotlib_font, get_needed_bands, INDEX_BAND_REQUIREMENTS,
+    setup_matplotlib_font, get_needed_bands,
 )
 from engine.core import (
     calc_ndvi,
@@ -46,21 +27,11 @@ from engine.core import (
     run_pipeline,
     run_pipeline_v3,
 )
-from engine.indices import (
-    compute_index, compute_all_indices,
-    INDEX_FUNCTIONS, INDEX_THRESHOLDS,
-    INDEX_CLASS_NAMES, INDEX_COLORS,
-)
-from engine.data_sources import (
-    get_data_source,
-    Sentinel2DataSource, LandsatDataSource, Sentinel1DataSource,
-)
-from engine.ml_detector import (
-    run_ml_change_detection,
-    RandomForestChangeDetector,
-)
+from engine.indices import compute_index, compute_all_indices
+from engine.data_sources import get_data_source
+from engine.ml_detector import run_ml_change_detection
+from engine.params import RunParams
 from engine.timeseries import TimeSeriesAnalyzer
-from engine.report_generator import PDFReportGenerator, generate_report_pdf
 
 warnings.filterwarnings("ignore")
 
@@ -113,49 +84,67 @@ def download_and_mosaic(boundary, year, out_dir):
 #  main() — 命令行入口
 # ============================================================================
 
-def main():
-    """命令行入口：运行完整的 v3 变化检测流程。"""
+def _parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="rs-change", description="多源遥感变化检测（未指定的参数取 config.py 默认值）")
+    ap.add_argument("--boundary", help="AOI 边界 GeoJSON（WGS84）")
+    ap.add_argument("--region", help="区域名称（用于输出文件名）")
+    ap.add_argument("--year1", type=int, help="前时相年份")
+    ap.add_argument("--year2", type=int, help="后时相年份")
+    ap.add_argument("--months", help="月份范围，如 6-10")
+    ap.add_argument("--source", dest="data_source",
+                    choices=["sentinel2", "landsat8", "landsat9", "sentinel1"])
+    ap.add_argument("--index", dest="index_type", help="NDVI/NDWI/MNDWI/NBR/EVI/SAVI/NDBI")
+    ap.add_argument("--mode", dest="detection_mode", choices=["multi", "binary", "ml"])
+    ap.add_argument("--cloud", dest="max_cloud_pct", type=float, help="场景云量上限 (%%)")
+    ap.add_argument("--threshold", type=float, help="变化阈值")
+    ap.add_argument("--severe", dest="severe_threshold", type=float, help="强烈变化阈值")
+    ap.add_argument("--adaptive", dest="adaptive_threshold", action="store_true", default=None,
+                    help="按稳定区噪声自动估计阈值")
+    ap.add_argument("--min-area", dest="min_area_m2", type=float, help="最小斑块面积（平方米）")
+    ap.add_argument("--formats", dest="output_formats", help="采样点格式，如 geojson,csv,shp")
+    ap.add_argument("--data-dir", help="数据/缓存目录（默认 ./data）")
+    ap.add_argument("--out", dest="out_dir", help="输出目录（默认 config.OUTPUT_DIR）")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    """命令行入口：运行完整的 v3 变化检测流程。成功返回 0，失败返回非 0。"""
+    # 中文 Windows 控制台默认 GBK：无法编码的字符替换输出，而不是让程序崩溃
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+    args = _parse_args(argv)
+    overrides = {k: v for k, v in vars(args).items()
+                 if k not in ("boundary", "months", "data_dir", "out_dir")}
+    overrides["boundary_file"] = args.boundary
+    if args.months:
+        ms, _, me = args.months.partition("-")
+        overrides.update(month_start=int(ms), month_end=int(me or ms))
+    try:
+        params = RunParams.from_config(**overrides)
+    except ValueError as e:
+        print(f"参数错误: {e}", file=sys.stderr)
+        return 2
+
     print("=" * 60)
     print("  遥感解译助手 v3 — 多源遥感变化检测")
-    print(f"  区域: {config.REGION_NAME}")
-    print(f"  时相: {config.YEAR1} vs {config.YEAR2}")
-    print(f"  数据源: {getattr(config, 'DATA_SOURCE', 'sentinel2')}")
-    print(f"  指数: {getattr(config, 'INDEX_TYPE', 'NDVI')}")
-    print(f"  模式: {config.DETECTION_MODE}")
+    print(f"  区域: {params.region}")
+    print(f"  时相: {params.year1} vs {params.year2}（{params.month_start}-{params.month_end} 月）")
+    print(f"  数据源: {params.data_source}   指数: {params.index_type}   模式: {params.detection_mode}")
     print("=" * 60)
 
     base = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(base, "data")
-    out_dir = os.path.join(base, config.OUTPUT_DIR)
-    os.makedirs(data_dir, exist_ok=True)
-    os.makedirs(out_dir, exist_ok=True)
-
-    boundary = get_boundary()
-    print(f"  Boundary loaded")
-
-    # 使用 v3 流水线
-    data_source = getattr(config, 'DATA_SOURCE', 'sentinel2')
-    index_type = getattr(config, 'INDEX_TYPE', 'NDVI')
-
-    print(f"\n[1/3] Downloading imagery ({data_source})...")
-    # v3 流水线内部处理下载
-    results = run_pipeline_v3(
-        data_source_name=data_source,
-        data_dir=data_dir,
-        out_dir=out_dir,
-        boundary=boundary,
-        index_type=index_type,
-        detection_mode=config.DETECTION_MODE,
-    )
+    out_dir = args.out_dir or os.path.join(base, config.OUTPUT_DIR)
+    results = run_pipeline_v3(params=params, data_dir=args.data_dir, out_dir=out_dir)
 
     if results.get("error"):
-        print(f"  Error: {results['error']}")
-        return
+        print(f"  Error: {results['error']}", file=sys.stderr)
+        return 1
 
-    # 打印统计
     stats = results.get("stats", {})
-    if config.DETECTION_MODE == "multi":
-        print(f"\n  ==== 变化统计 ({index_type}) ====")
+    if params.detection_mode != "binary":
+        print(f"\n  ==== 变化统计 ({params.index_type}) ====")
         for cls_val in [-3, -2, 1, 2, 3]:
             s = stats.get(cls_val, {})
             if s:
@@ -170,12 +159,11 @@ def main():
               f"({stats.get('changed_percent', 0):.1f}%)")
 
     print(f"\n  Sampling: {results.get('num_sample_points', 0)} points")
-    timing = results.get("timing", {})
-    print(f"  Total time: {timing.get('total', 0):.0f}s")
-
+    print(f"  Total time: {results.get('timing', {}).get('total', 0):.0f}s")
     print(f"\n{'=' * 60}")
     print(f"  Done! Output: {out_dir}")
     print(f"{'=' * 60}")
+    return 0
 
 
 # ============================================================================
@@ -202,8 +190,9 @@ __all__ = [
     "compute_all_indices",
     "get_data_source",
     "get_needed_bands",
+    "RunParams",
 ]
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

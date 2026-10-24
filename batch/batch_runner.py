@@ -19,52 +19,37 @@ import json
 import time
 import argparse
 import traceback
-from contextlib import contextmanager
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
-import config
 from engine.utils import log
 
 
-def _task_overrides(task, boundary_file):
-    """把任务字段映射为 config 属性覆盖值（未指定的沿用当前 config）。"""
-    return {
-        "REGION_NAME": task.get("region", config.REGION_NAME),
-        "BOUNDARY_FILE": boundary_file,
-        "YEAR1": task.get("year1", config.YEAR1),
-        "YEAR2": task.get("year2", config.YEAR2),
-        "MONTH_START": task.get("month_start", config.MONTH_START),
-        "MONTH_END": task.get("month_end", config.MONTH_END),
-        "DETECTION_MODE": task.get("detection_mode", config.DETECTION_MODE),
-        "INDEX_TYPE": task.get("index_type", config.INDEX_TYPE),
-        "DATA_SOURCE": task.get("data_source", config.DATA_SOURCE),
-        "CHANGE_THRESHOLD": task.get("threshold", config.CHANGE_THRESHOLD),
-        "SEVERE_THRESHOLD": task.get("severe_threshold", config.SEVERE_THRESHOLD),
-        "NUM_SAMPLE_POINTS": task.get("sample_points", config.NUM_SAMPLE_POINTS),
-        "OUTPUT_FORMATS": task.get("formats", config.OUTPUT_FORMATS),
-        "GENERATE_REPORT": task.get("report", config.GENERATE_REPORT),
-    }
+def task_params(task, boundary_file=None):
+    """把任务字段映射为 RunParams（未指定的沿用 config 默认值；参数错误抛 ValueError）。
 
-
-@contextmanager
-def _config_overrides(overrides):
-    """临时覆盖全局 config 属性，退出时（含异常）还原，任务之间互不污染。
-
-    模块对象不能 copy.copy（会抛 TypeError），所以只保存/还原被覆盖的属性。
+    每个任务持有独立的 RunParams，不修改全局 config，任务之间互不污染。
     """
-    saved = {k: getattr(config, k) for k in overrides if hasattr(config, k)}
-    try:
-        for k, v in overrides.items():
-            setattr(config, k, v)
-        yield
-    finally:
-        for k in overrides:
-            if k in saved:
-                setattr(config, k, saved[k])
-            else:
-                delattr(config, k)
+    from engine.params import RunParams
+    return RunParams.from_config(
+        region=task.get("region"),
+        boundary_file=boundary_file or task.get("boundary"),
+        year1=task.get("year1"), year2=task.get("year2"),
+        month_start=task.get("month_start"), month_end=task.get("month_end"),
+        data_source=task.get("data_source"),
+        index_type=task.get("index_type"),
+        detection_mode=task.get("detection_mode"),
+        max_cloud_pct=task.get("max_cloud_pct"),
+        threshold=task.get("threshold"),
+        severe_threshold=task.get("severe_threshold"),
+        adaptive_threshold=task.get("adaptive_threshold"),
+        min_area_m2=task.get("min_area_m2"),
+        num_sample_points=task.get("sample_points"),
+        min_point_distance_m=task.get("min_point_distance_m"),
+        output_formats=task.get("formats"),
+        generate_report=task.get("report"),
+    )
 
 
 class BatchRunner:
@@ -162,24 +147,15 @@ class BatchRunner:
             try:
                 log(f"\n[{task_idx}/{total}] {task_id} (attempt {attempt + 1})")
 
-                overrides = _task_overrides(task, boundary_file)
+                params = task_params(task, boundary_file)
                 out_dir = os.path.join(
                     BASE_DIR, self.configs.get("output_base", "output"), task_id)
-                data_dir = os.path.join(
-                    BASE_DIR, "data", overrides["REGION_NAME"] or task_id)
+                data_dir = os.path.join(BASE_DIR, "data", params.region or task_id)
 
                 from engine.core import run_pipeline_v3
-                # run_pipeline_v3 仍读取全局 config：任务期间临时覆盖，结束后还原
-                with _config_overrides(overrides):
-                    r = run_pipeline_v3(
-                        data_source_name=overrides["DATA_SOURCE"],
-                        data_dir=data_dir,
-                        out_dir=out_dir,
-                        index_type=overrides["INDEX_TYPE"],
-                        detection_mode=overrides["DETECTION_MODE"],
-                        threshold=task.get("threshold"),
-                        severe_threshold=task.get("severe_threshold"),
-                    )
+                r = run_pipeline_v3(params=params, data_dir=data_dir, out_dir=out_dir)
+                if r.get("error"):
+                    raise RuntimeError(r["error"])
 
                 elapsed = time.time() - t0
                 r["task_id"] = task_id
@@ -190,6 +166,11 @@ class BatchRunner:
                 log(f"  ✅ {task_id} — {elapsed:.0f}s")
                 return r
 
+            except ValueError as e:
+                # 参数错误重试也不会成功
+                log(f"  ❌ {task_id} 参数无效: {e}")
+                result["error"] = str(e)
+                break
             except Exception as e:
                 elapsed = time.time() - t0
                 log(f"  ❌ {task_id} attempt {attempt + 1} failed: {e}")
@@ -235,7 +216,7 @@ class BatchRunner:
 
     def _summary(self, results):
         log(f"\n{'='*60}")
-        log(f"  Batch Summary")
+        log("  Batch Summary")
         log(f"{'='*60}")
         success = [r for r in results if r.get("status") == "success"]
         failed = [r for r in results if r.get("status") == "failed"]

@@ -96,7 +96,7 @@ def test_pipeline_cache_hit_still_masks_clouds(tmp_path, monkeypatch, with_scl):
     """
     import engine.core as core
     import engine.data_sources as ds
-    from engine.cache import SnapshotCache, compute_aoi_hash, snapshot_key
+    from engine.cache import PERIOD_KIND, SnapshotCache, compute_aoi_hash, period_key
     from engine.preprocessing import PREPROCESSING_VERSION
 
     y1, y2 = 2021, 2023
@@ -112,31 +112,34 @@ def test_pipeline_cache_hit_still_masks_clouds(tmp_path, monkeypatch, with_scl):
 
     cache_root = tmp_path / "cache"
     sc = SnapshotCache(cache_root=str(cache_root))
-    key = snapshot_key(aoi_hash, "sentinel2", "NDVI", y1, y2, 6, 10, 50,
-                       bands, PREPROCESSING_VERSION)
-    sc.put_snapshot(key, {
-        "aoi_hash": aoi_hash, "data_source": "sentinel2", "index_type": "NDVI",
-        "year1": y1, "year2": y2, "month_start": 6, "month_end": 10,
-        "max_cloud_pct": 50, "bands": bands,
-        "preprocessing_version": PREPROCESSING_VERSION,
-    })
-    d = sc.get_band_dir(key)
+    period_dirs = {}
+    for year in (y1, y2):
+        key = period_key(aoi_hash, "sentinel2", year, 6, 10, 50, bands, PREPROCESSING_VERSION)
+        sc.put_snapshot(key, {
+            "kind": PERIOD_KIND, "aoi_hash": aoi_hash, "data_source": "sentinel2",
+            "year": year, "month_start": 6, "month_end": 10,
+            "max_cloud_pct": 50, "bands": bands,
+            "preprocessing_version": PREPROCESSING_VERSION,
+        })
+        period_dirs[year] = (key, sc.get_band_dir(key))
+    d1, d2 = period_dirs[y1][1], period_dirs[y2][1]
 
     red = np.full((n, n), 500, np.uint16)
     nir = np.full((n, n), 3000, np.uint16)
     red2, nir2 = red.copy(), nir.copy()
     red2[:20, :20], nir2[:20, :20] = 3000, 3200        # 亮云
-    _write_tif(os.path.join(d, f"B4_{y1}.tif"), red, 10)
-    _write_tif(os.path.join(d, f"B8_{y1}.tif"), nir, 10)
-    _write_tif(os.path.join(d, f"B4_{y2}.tif"), red2, 10)
-    _write_tif(os.path.join(d, f"B8_{y2}.tif"), nir2, 10)
+    _write_tif(os.path.join(d1, f"B4_{y1}.tif"), red, 10)
+    _write_tif(os.path.join(d1, f"B8_{y1}.tif"), nir, 10)
+    _write_tif(os.path.join(d2, f"B4_{y2}.tif"), red2, 10)
+    _write_tif(os.path.join(d2, f"B8_{y2}.tif"), nir2, 10)
     if with_scl:
         scl1 = np.full((n // 2, n // 2), 4, np.uint8)
         scl2 = scl1.copy()
         scl2[:10, :10] = 9
-        _write_tif(os.path.join(d, f"SCL_{y1}.tif"), scl1, 20)
-        _write_tif(os.path.join(d, f"SCL_{y2}.tif"), scl2, 20)
-    sc.mark_complete(key)
+        _write_tif(os.path.join(d1, f"SCL_{y1}.tif"), scl1, 20)
+        _write_tif(os.path.join(d2, f"SCL_{y2}.tif"), scl2, 20)
+    for key, _ in period_dirs.values():
+        sc.mark_complete(key)
 
     class OfflineSource:
         name = "sentinel2"
@@ -167,45 +170,56 @@ def test_pipeline_cache_hit_still_masks_clouds(tmp_path, monkeypatch, with_scl):
 
 def test_old_cache_versions_are_not_reused(tmp_path):
     """旧版缓存（v3.1 存的是写回的浮点反射率）不能被新预处理复用。"""
-    from engine.cache import SnapshotCache, snapshot_key
+    from engine.cache import PERIOD_KIND, SnapshotCache, period_key
     from engine.preprocessing import PREPROCESSING_VERSION
 
     sc = SnapshotCache(cache_root=str(tmp_path))
-    args = ("aoi", "sentinel2", "NDVI", 2024, 2025, 6, 10, 50, ["red", "nir"])
+    args = ("aoi", "sentinel2", 2024, 6, 10, 50, ["red", "nir"])
     sc.put_snapshot("old", dict(zip(
-        ["aoi_hash", "data_source", "index_type", "year1", "year2",
-         "month_start", "month_end", "max_cloud_pct", "bands"], args),
-        preprocessing_version="v3.1"))
+        ["aoi_hash", "data_source", "year", "month_start", "month_end",
+         "max_cloud_pct", "bands"], args),
+        kind=PERIOD_KIND, preprocessing_version="v3.1"))
     sc.mark_complete("old")
 
-    assert sc.find(*args, preprocessing_version=PREPROCESSING_VERSION) is None
+    assert sc.find_period(*args, PREPROCESSING_VERSION) is None
+    assert sc.find_period(*args, "v3.1") == "old"
     # 参数不同 -> 目录名不同，不再互相覆盖
-    assert snapshot_key(*args, PREPROCESSING_VERSION) != \
-        snapshot_key(*args[:5], 7, *args[6:], PREPROCESSING_VERSION)
-    assert snapshot_key(*args, "v3.1") != snapshot_key(*args, PREPROCESSING_VERSION)
+    assert period_key(*args, PREPROCESSING_VERSION) != \
+        period_key(*args[:3], 7, *args[4:], PREPROCESSING_VERSION)
+    assert period_key(*args, "v3.1") != period_key(*args, PREPROCESSING_VERSION)
 
 
 @pytest.mark.parametrize("n_tiles", [1, 2])
 def test_landsat_qa_pixel_path_exists(tmp_path, n_tiles):
-    """QA_PIXEL 下载后返回的路径必须存在（原先返回已被移走/删除的临时文件）。"""
-    from engine.data_sources import _download_qa_pixel_generic
+    """QA_PIXEL 下载后返回的路径必须存在且在分析网格上；网格外填 1 (Fill)。"""
+    from engine.data_sources import LandsatDataSource
 
-    def fake_download(item, band_name, out_path):
-        arr = np.full((10, 10), 21824, np.uint16)       # Landsat 晴空值
+    # 每景 10x10 px (30 m)，第二景向东偏移 300 m
+    scenes = []
+    for i in range(n_tiles):
+        href = str(tmp_path / f"qa_{i}.tif")
         with rasterio.open(
-            out_path, "w", driver="GTiff", height=10, width=10, count=1,
+            href, "w", driver="GTiff", height=10, width=10, count=1,
             dtype="uint16", crs=CRS, nodata=1,
-            transform=Affine(30, 0, X0 + item.offset, 0, -30, Y0),
+            transform=Affine(30, 0, X0 + i * 300, 0, -30, Y0),
         ) as dst:
-            dst.write(arr, 1)
+            dst.write(np.full((10, 10), 21824, np.uint16), 1)   # Landsat 晴空值
+        item = SimpleNamespace(id=f"LC08_L2SP_12304{i}", datetime=datetime(2023, 7, 1),
+                               properties={}, assets={"qa_pixel": SimpleNamespace(href=href)})
+        scenes.append({"tile": f"t{i}", "item": item})
 
-    scenes = [{"tile": f"t{i}",
-               "item": SimpleNamespace(datetime=datetime(2023, 7, 1), offset=i * 300)}
-              for i in range(n_tiles)]
-    out = _download_qa_pixel_generic(scenes, str(tmp_path), fake_download)
+    src = LandsatDataSource("landsat-8")
+    boundary = _boundary_for_grid(600, 300, pad=-10)
+    out = src.download_quality_bands(scenes, str(tmp_path / "out"), boundary)
 
-    assert out["qa_pixel"] == os.path.join(str(tmp_path), "QA_PIXEL_2023.tif")
-    assert os.path.exists(out["qa_pixel"])
+    assert out["qa_pixel"] == os.path.join(str(tmp_path / "out"), "QA_PIXEL_2023.tif")
+    with rasterio.open(out["qa_pixel"]) as f:
+        qa = f.read(1)
+        assert f.res == (30.0, 30.0)
+        assert f.transform.c % 30 == 15 and f.transform.f % 30 == 15   # C2 网格对齐
+    assert qa.dtype == np.uint16 and set(np.unique(qa)) == {1, 21824}
+    # 每景 100 px 全部落入网格，两景拼接不重叠、不丢失
+    assert (qa == 21824).sum() == 100 * n_tiles
 
 
 # ============================================================================
@@ -249,16 +263,18 @@ def test_harmonized_ndvi_matches_across_baselines(tmp_path):
     np.testing.assert_array_equal(
         harmonize_s2_dn(np.array([0, 900, 1000, 1001], np.uint16), 1000), [0, 1, 1, 1])
 
-    # 下载函数逐景归一化；SCL 分类层不受影响
+    # 读取时逐景归一化；SCL 分类层不受影响
+    from rasterio.enums import Resampling
+    from engine.grid import GridSpec
     src = Sentinel2DataSource()
     href = _write_tif(tmp_path / "remote.tif", new["red"], 10)
     item = _s2_item(datetime(2023, 7, 1), "04.00", href=href)
-    out = src._download_single_band(item, "red", str(tmp_path / "red.tif"))
-    with rasterio.open(out) as f:
-        np.testing.assert_array_equal(f.read(1), old["red"])
-    out = src._download_single_band(item, "scl", str(tmp_path / "scl.tif"))
-    with rasterio.open(out) as f:
-        np.testing.assert_array_equal(f.read(1), new["red"])
+    with rasterio.open(href) as f:
+        grid = GridSpec.from_src(f)
+    red = src._read_to_grid(item, "red", grid, Resampling.nearest, 0)
+    np.testing.assert_array_equal(red, old["red"])
+    scl = src._read_to_grid(item, "scl", grid, Resampling.nearest, 0)
+    np.testing.assert_array_equal(scl, new["red"])
 
 
 # ============================================================================
@@ -299,13 +315,13 @@ def _make_runner(tmp_path, task):
 
 
 def test_batch_runner_task_runs_and_restores_config(tmp_path, monkeypatch):
-    """原先 copy.copy(config) 抛 TypeError，所有任务失败；任务参数也要真正生效。"""
+    """原先 copy.copy(config) 抛 TypeError，所有任务失败；任务参数要通过 RunParams 生效，
+    且全局 config 不被修改。"""
     import engine.core as core
     seen = {}
 
-    def fake_pipeline(**kwargs):
-        seen.update(kwargs, region=config.REGION_NAME, years=(config.YEAR1, config.YEAR2),
-                    n_points=config.NUM_SAMPLE_POINTS)
+    def fake_pipeline(params=None, **kwargs):
+        seen.update(kwargs, params=params)
         return {"stats": {}, "files": {}}
 
     monkeypatch.setattr(core, "run_pipeline_v3", fake_pipeline)
@@ -318,9 +334,11 @@ def test_batch_runner_task_runs_and_restores_config(tmp_path, monkeypatch):
     r = _make_runner(tmp_path, task)._run_single_task(task, 1, 1)
 
     assert r["status"] == "success", r.get("error")
-    assert seen["region"] == "测试区" and seen["years"] == (2019, 2024)
-    assert seen["threshold"] == 0.2 and seen["n_points"] == 500
-    assert {k: getattr(config, k) for k in before} == before, "任务结束后应还原 config"
+    p = seen["params"]
+    assert p.region == "测试区" and (p.year1, p.year2) == (2019, 2024)
+    assert p.threshold == 0.2 and p.num_sample_points == 500
+    assert p.boundary_file.endswith("aoi.geojson") and os.path.isabs(p.boundary_file)
+    assert {k: getattr(config, k) for k in before} == before, "不应修改全局 config"
 
 
 def test_batch_runner_restores_config_on_failure(tmp_path, monkeypatch):
@@ -338,6 +356,31 @@ def test_batch_runner_restores_config_on_failure(tmp_path, monkeypatch):
 
     assert r["status"] == "failed" and "download failed" in r["error"]
     assert config.REGION_NAME == region_before
+
+
+def test_batch_runner_reports_pipeline_error_and_bad_params(tmp_path, monkeypatch):
+    """流水线返回 error 不能记为成功；参数非法时不重试、不调用流水线。"""
+    import engine.core as core
+    calls = []
+
+    def soft_fail(**kwargs):
+        calls.append(kwargs)
+        return {"error": "未找到符合条件的影像"}
+
+    monkeypatch.setattr(core, "run_pipeline_v3", soft_fail)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    task = {"id": "t3", "region": "区", "boundary": "aoi.geojson", "max_retries": 1}
+    r = _make_runner(tmp_path, task)._run_single_task(task, 1, 1)
+    assert r["status"] == "failed" and "未找到" in r["error"]
+    assert len(calls) == 2                                  # 1 次 + 1 次重试
+
+    calls.clear()
+    bad = {"id": "t4", "region": "区", "boundary": "aoi.geojson",
+           "year1": 2024, "year2": 2024, "max_retries": 3}
+    r = _make_runner(tmp_path, bad)._run_single_task(bad, 1, 1)
+    assert r["status"] == "failed" and "年份不能相同" in r["error"]
+    assert calls == []
 
 
 # ============================================================================

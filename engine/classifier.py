@@ -14,8 +14,6 @@
 依赖: numpy, scipy, sklearn（已有）
 """
 
-import os
-import time
 import numpy as np
 from scipy.ndimage import uniform_filter, sobel
 
@@ -182,20 +180,6 @@ def extract_texture(band, window_size=3):
     }
 
 
-def extract_all_textures(bands):
-    """从所有可用波段提取纹理特征并拼接。
-
-    返回:
-        np.ndarray: (H, W, 2 * N_bands) 纹理特征张量
-    """
-    texture_stack = []
-    for bname, arr in bands.items():
-        tex = extract_texture(arr)
-        texture_stack.append(tex["variance"])
-        texture_stack.append(tex["edge_density"])
-    return np.stack(texture_stack, axis=-1)
-
-
 # ============================================================================
 #  特征堆叠：10 波段 + 6 指数 + 纹理
 # ============================================================================
@@ -284,7 +268,6 @@ def pca_gmm_classify(feature_stack, n_clusters=6, sample_ratio=0.05,
 
     h, w, c = feature_stack.shape
     pixels = feature_stack.reshape(-1, c)  # (N, C)
-    n_pixels = pixels.shape[0]
 
     # 剔除无效像元 (全 0 行) 避免干扰标准化
     valid_rows = ~(np.max(np.abs(pixels), axis=1) == 0)
@@ -296,6 +279,7 @@ def pca_gmm_classify(feature_stack, n_clusters=6, sample_ratio=0.05,
 
     # 随机采样用于 PCA 拟合
     n_sample = max(1000, min(int(pixels_scaled.shape[0] * sample_ratio), 50000))
+    n_sample = min(n_sample, pixels_scaled.shape[0])
     rng = np.random.RandomState(random_state)
     sample_idx = rng.choice(pixels_scaled.shape[0], n_sample, replace=False)
     sample_data = pixels_scaled[sample_idx]
@@ -309,7 +293,8 @@ def pca_gmm_classify(feature_stack, n_clusters=6, sample_ratio=0.05,
     pixels_all_scaled = scaler.transform(pixels)
     pca_all = pca.transform(pixels_all_scaled).reshape(h, w, pca_dims)
 
-    # 用降维后的数据做 GMM
+    # 用降维后的数据做 GMM：只在有效像元的采样上拟合（大影像全图拟合
+    # 既慢又占内存，且无效像元会被当成一个光谱簇），再预测全图
     pca_flat = pca_all.reshape(-1, pca_dims)
 
     gmm = GaussianMixture(
@@ -319,7 +304,7 @@ def pca_gmm_classify(feature_stack, n_clusters=6, sample_ratio=0.05,
         max_iter=200,
         n_init=3,
     )
-    gmm.fit(pca_flat)
+    gmm.fit(pca.transform(sample_data))
 
     labels = gmm.predict(pca_flat).reshape(h, w)
     probs = gmm.predict_proba(pca_flat).reshape(h, w, n_clusters)
@@ -377,8 +362,6 @@ def uncertainty_sampling(pca_3d, gmm, n_samples=200):
     pca_flat = pca_3d.reshape(-1, n_dims)
     probs = gmm.predict_proba(pca_flat)
 
-    # 策略 1: 最大概率置信度（越低越不确定）
-    confidence = probs.max(axis=1)  # (N,)
     entropy = -np.sum(probs * np.log(probs + 1e-10), axis=1)  # (N,)
 
     # 不确定性分数 = 熵（归一化）

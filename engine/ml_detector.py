@@ -51,7 +51,7 @@ class RandomForestChangeDetector:
         Returns:
             np.ndarray: (N_valid, n_features) 特征矩阵。
         """
-        from engine.indices import compute_index, INDEX_FUNCTIONS
+        from engine.indices import compute_index
 
         h, w = list(bands_y1.values())[0].shape[:2]
         valid_idx = np.where(valid_mask)
@@ -79,13 +79,12 @@ class RandomForestChangeDetector:
         if 'nir' in bands_y1 and 'red' in bands_y1:
             ndvi1 = compute_index("NDVI", bands_y1)
             ndvi2 = compute_index("NDVI", bands_y2)
-            diff_ndvi = ndvi2 - ndvi1
-            try:
-                from scipy.ndimage import generic_filter
-                local_var = generic_filter(diff_ndvi, np.var, size=3)
-                features.append(local_var[valid_idx].reshape(-1, 1))
-            except ImportError:
-                pass
+            diff_ndvi = (ndvi2 - ndvi1).astype(np.float32)
+            # 3x3 局部方差 = E[x²] - E[x]²（卷积实现，比 generic_filter 快数百倍）
+            from scipy.ndimage import uniform_filter
+            mean = uniform_filter(diff_ndvi, size=3)
+            local_var = np.maximum(uniform_filter(diff_ndvi ** 2, size=3) - mean ** 2, 0)
+            features.append(local_var[valid_idx].reshape(-1, 1))
 
         X = np.hstack(features)
         self.feature_names = [f"feat_{i}" for i in range(X.shape[1])]
@@ -192,6 +191,7 @@ class RandomForestChangeDetector:
 def run_ml_change_detection(bands_y1, bands_y2, valid_mask,
                             method="random_forest", model_path=None,
                             train_mode=False, labels=None,
+                            area_per_px_ha=0.01, class_names=None,
                             **kwargs):
     """机器学习变化检测统一入口。
 
@@ -202,6 +202,8 @@ def run_ml_change_detection(bands_y1, bands_y2, valid_mask,
         model_path: 模型文件路径。
         train_mode: True=训练（需 labels），False=推理。
         labels: 训练标签数组（train_mode=True 时必需）。
+        area_per_px_ha: 结果网格的像元面积 (ha)，用于面积统计。
+        class_names: {类别: 名称}，None=植被变化默认名称。
         **kwargs: 传递给具体检测器的参数。
 
     Returns:
@@ -219,13 +221,13 @@ def run_ml_change_detection(bands_y1, bands_y2, valid_mask,
 
         # 生成与阈值法兼容的统计格式
         h, w = result.shape
-        cls_names = {-3: "严重退化", -2: "中度退化", 1: "稳定",
-                      2: "中度恢复", 3: "强烈恢复"}
+        cls_names = class_names or {-3: "严重退化", -2: "中度退化", 1: "稳定",
+                                    2: "中度恢复", 3: "强烈恢复"}
         stats = {}
         total_valid = valid_mask.sum()
         for cv in [-3, -2, 1, 2, 3]:
             n_px = (result == cv).sum()
-            area_ha = n_px * 0.01
+            area_ha = n_px * area_per_px_ha
             pct = n_px * 100 / max(total_valid, 1)
             stats[cv] = {
                 "name": cls_names[cv],
@@ -236,12 +238,13 @@ def run_ml_change_detection(bands_y1, bands_y2, valid_mask,
         changed_px = sum((result == c).sum() for c in [-3, -2, 2, 3])
         stats["changed_total"] = {
             "pixels": int(changed_px),
-            "area_ha": round(changed_px * 0.01, 2),
+            "area_ha": round(changed_px * area_per_px_ha, 2),
             "percent": round(changed_px * 100 / max(total_valid, 1), 2)
         }
         stats["valid_pixels"] = int(total_valid)
         stats["total_pixels"] = h * w
         stats["ml_method"] = method
+        stats["_area_per_px_ha"] = area_per_px_ha
 
         return result, stats
 

@@ -1,18 +1,29 @@
 """
 遥感解译助手 v3 — 多源遥感数据接口
 
-支持: Sentinel-2 L2A / Landsat 8/9 / Sentinel-1 GRD
+支持: Sentinel-2 L2A / Landsat 8/9 Collection 2 L2 / Sentinel-1 GRD（实验性）
+
+下载策略:
+  - 只读取 AOI 范围：通过 WarpedVRT 对远端 COG 做窗口读取，不再下载整景瓦片
+  - 直接重投影到由 AOI 决定的统一分析网格（grid.aoi_grid），
+    同一 AOI 的所有年份、所有波段落在完全相同的网格上
+  - 跨 UTM 带的瓦片先变换到同一网格再镶嵌（按覆盖率优先，先到先得）
 """
 
-import os, sys
+import os
+import calendar
+
 import numpy as np
 import rasterio
-from rasterio.merge import merge
-from shapely.geometry import box as sbox
+from rasterio.vrt import WarpedVRT
+from rasterio.warp import Resampling
+from shapely.geometry import shape, box as sbox
 
+from engine.grid import aoi_grid
 from engine.preprocessing import harmonize_s2_dn, s2_boa_offset
+from engine.utils import log
 
-import calendar
+PC_STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
 
 def _last_day_of_month(year: int, month: int) -> int:
@@ -20,16 +31,207 @@ def _last_day_of_month(year: int, month: int) -> int:
     return calendar.monthrange(year, month)[1]
 
 
-class Sentinel2DataSource:
+def _open_catalog():
+    try:
+        import pystac_client
+        import planetary_computer
+    except ImportError as e:
+        raise ImportError(
+            "需要 pystac-client 和 planetary-computer：pip install -r requirements.txt"
+        ) from e
+    return pystac_client.Client.open(
+        PC_STAC_URL, modifier=planetary_computer.sign_inplace)
+
+
+def footprint_coverage(boundary, item) -> float:
+    """AOI 被该景实际数据足迹覆盖的比例。
+
+    使用 item.geometry（真实足迹）而非 item.bbox：轨道边缘的瓦片
+    bbox 内常有大片无数据区域，用 bbox 会高估覆盖率。
+    """
+    if boundary.area <= 0:
+        return 0.0
+    geom = getattr(item, "geometry", None)
+    footprint = shape(geom) if geom else sbox(*item.bbox)
+    return boundary.intersection(footprint).area / boundary.area
+
+
+class StacDataSource:
+    """Planetary Computer STAC 数据源基类。
+
+    子类只需声明集合、波段映射与网格参数；搜索、窗口读取、
+    镶嵌与写盘逻辑共用。
+    """
+
+    name = ""
+    collection = ""
+    # 逻辑波段名 -> 候选 asset key（按顺序取第一个存在的）
+    BAND_MAP: dict = {}
+    # 逻辑波段名 -> 输出文件名前缀
+    FILE_NAME_MAP: dict = {}
+    # (逻辑波段名, 文件前缀, 网格外填充值)；None=无质量波段
+    QUALITY_BAND = None
+    RESOLUTION = 10.0
+    GRID_ORIGIN_OFFSET = 0.0
+    MIN_COVERAGE = 0.01
+
+    def __init__(self):
+        self._catalog = None
+
+    # ------------------------------------------------------------------ 搜索
+
+    def _get_catalog(self):
+        if self._catalog is None:
+            self._catalog = _open_catalog()
+        return self._catalog
+
+
+    def _query(self, max_cloud_pct):
+        return {"eo:cloud_cover": {"lt": max_cloud_pct}}
+
+    def _tile_key(self, item):
+        return item.id
+
+    def _cloud(self, item):
+        return item.properties.get("eo:cloud_cover", 0)
+
+    def search_scenes(self, boundary, year, month_start=6, month_end=10,
+                      max_cloud_pct=50):
+        """搜索并为每个瓦片选出「覆盖率 × 云量」得分最高的一景。
+
+        返回的每个场景都带上 "aoi"，供 download_bands 确定分析网格。
+        """
+        date_range = (f"{year}-{month_start:02d}-01/"
+                      f"{year}-{month_end:02d}-{_last_day_of_month(year, month_end):02d}")
+        items = list(self._get_catalog().search(
+            collections=[self.collection], bbox=boundary.bounds,
+            datetime=date_range, query=self._query(max_cloud_pct),
+            max_items=200).items())
+        return self.select_scenes(boundary, items)
+
+    def select_scenes(self, boundary, items):
+        """按瓦片分组择优（与网络无关，便于测试）。"""
+        groups = {}
+        for item in items:
+            groups.setdefault(self._tile_key(item), []).append(item)
+
+        best = []
+        for tile, its in groups.items():
+            scored = []
+            for it in its:
+                cov = footprint_coverage(boundary, it)
+                scored.append((cov * 100 - self._cloud(it) * 0.3, cov, it))
+            _, cov, item = max(scored, key=lambda x: x[0])
+            if cov < self.MIN_COVERAGE:
+                continue
+            best.append({"tile": tile, "item": item, "coverage": cov,
+                         "cloud": self._cloud(item), "aoi": boundary})
+        best.sort(key=lambda s: -s["coverage"])
+        return best
+
+    # ------------------------------------------------------------------ 读取
+
+    def analysis_grid(self, boundary):
+        return aoi_grid(boundary, self.RESOLUTION, origin_offset=self.GRID_ORIGIN_OFFSET)
+
+    def _asset_href(self, item, band_name):
+        for key in self.BAND_MAP.get(band_name, (band_name,)):
+            asset = item.assets.get(key)
+            if asset is not None:
+                return asset.href
+        raise ValueError(f"Band '{band_name}' not found in item {item.id}")
+
+    def _postprocess(self, item, band_name, arr):
+        """逐景后处理钩子（如 S2 基线偏移归一化）。"""
+        return arr
+
+    def _read_to_grid(self, item, band_name, grid, resampling, nodata):
+        """把一景的一个波段窗口读取并变换到分析网格上。"""
+        with rasterio.open(self._asset_href(item, band_name)) as src:
+            src_nodata = src.nodata if src.nodata is not None else nodata
+            with WarpedVRT(src, crs=grid.crs, transform=grid.transform,
+                           width=grid.width, height=grid.height,
+                           resampling=resampling,
+                           src_nodata=src_nodata, nodata=nodata) as vrt:
+                arr = vrt.read(1)
+        return self._postprocess(item, band_name, arr)
+
+    def _mosaic(self, scenes, band_name, grid, resampling, nodata):
+        """按场景顺序（覆盖率降序）先到先得镶嵌；全部失败返回 None。"""
+        out = None
+        for s in scenes:
+            try:
+                arr = self._read_to_grid(s["item"], band_name, grid, resampling, nodata)
+            except Exception as e:
+                log(f"    Warning: {band_name}/{s['tile']}: {e}")
+                continue
+            if out is None:
+                out = np.full(grid.shape, nodata, dtype=arr.dtype)
+            fill = (out == nodata) & (arr != nodata)
+            out[fill] = arr[fill]
+        return out
+
+    def _write(self, arr, grid, path, nodata):
+        meta = grid.to_meta(dtype=arr.dtype.name)
+        meta.update(nodata=nodata, tiled=True, blockxsize=256, blockysize=256)
+        with rasterio.open(path, "w", **meta) as dst:
+            dst.write(arr, 1)
+        return path
+
+    def _grid_for(self, scenes, boundary):
+        boundary = boundary or (scenes[0].get("aoi") if scenes else None)
+        if boundary is None:
+            raise ValueError("scenes 缺少 AOI：请使用 search_scenes() 的结果或传入 boundary")
+        return self.analysis_grid(boundary)
+
+    def download_bands(self, scenes, out_dir, bands=None, boundary=None):
+        """下载 AOI 范围内的波段到统一分析网格。
+
+        Returns:
+            {逻辑波段名: GeoTIFF 路径}，文件名 <前缀>_<年份>.tif
+        """
+        bands = bands or ["red", "nir"]
+        if not scenes:
+            return {}
+        os.makedirs(out_dir, exist_ok=True)
+        grid = self._grid_for(scenes, boundary)
+        year = scenes[0]["item"].datetime.year
+        result = {}
+        for band_name in bands:
+            arr = self._mosaic(scenes, band_name, grid, Resampling.bilinear, 0)
+            if arr is None:
+                continue
+            fname = self.FILE_NAME_MAP.get(band_name, band_name.upper())
+            result[band_name] = self._write(
+                arr, grid, os.path.join(out_dir, f"{fname}_{year}.tif"), 0)
+        return result
+
+    def download_quality_bands(self, scenes, out_dir, boundary=None) -> dict[str, str]:
+        """下载质量波段（最近邻重采样到同一分析网格）。"""
+        if not self.QUALITY_BAND or not scenes:
+            return {}
+        band_name, prefix, fill = self.QUALITY_BAND
+        os.makedirs(out_dir, exist_ok=True)
+        grid = self._grid_for(scenes, boundary)
+        arr = self._mosaic(scenes, band_name, grid, Resampling.nearest, fill)
+        if arr is None:
+            return {}
+        year = scenes[0]["item"].datetime.year
+        return {band_name: self._write(
+            arr, grid, os.path.join(out_dir, f"{prefix}_{year}.tif"), fill)}
+
+
+class Sentinel2DataSource(StacDataSource):
     """Sentinel-2 L2A via Planetary Computer STAC."""
 
     name = "sentinel2"
+    collection = "sentinel-2-l2a"
 
     BAND_MAP = {
-        "red": "B04", "nir": "B08", "green": "B03", "blue": "B02",
-        "swir1": "B11", "swir2": "B12",
-        "rededge1": "B05", "rededge2": "B06", "rededge3": "B07",
-        "scl": "SCL",
+        "red": ("B04",), "nir": ("B08",), "green": ("B03",), "blue": ("B02",),
+        "swir1": ("B11",), "swir2": ("B12",),
+        "rededge1": ("B05",), "rededge2": ("B06",), "rededge3": ("B07",),
+        "scl": ("SCL",),
     }
 
     # 输出文件名映射 (匹配 _load_bands 的 B4/B8 约定)
@@ -38,156 +240,30 @@ class Sentinel2DataSource:
         "swir1": "B11", "swir2": "B12",
     }
 
-    def __init__(self):
-        self._catalog = None
+    QUALITY_BAND = ("scl", "SCL", 0)
+    RESOLUTION = 10.0
 
-    def _get_catalog(self):
-        if self._catalog is None:
-            try:
-                import pystac_client
-                import planetary_computer
-            except ImportError:
-                import subprocess as sp
-                sp.run([sys.executable, "-m", "pip", "install",
-                        "pystac-client", "planetary-computer", "--quiet"],
-                       capture_output=True)
-                import pystac_client
-                import planetary_computer
-            self._catalog = pystac_client.Client.open(
-                "https://planetarycomputer.microsoft.com/api/stac/v1",
-                modifier=planetary_computer.sign_inplace)
-        return self._catalog
+    def _tile_key(self, item):
+        return item.properties.get("s2:mgrs_tile") or item.id.split("_")[-2]
 
-    def get_band_aliases(self):
-        return self.BAND_MAP.copy()
-
-    def search_scenes(self, boundary, year, month_start=6, month_end=10,
-                      max_cloud_pct=50):
-        catalog = self._get_catalog()
-        date_fmt = f"{year}-{month_start:02d}-01/{year}-{month_end:02d}-{_last_day_of_month(year, month_end):02d}"
-        search = catalog.search(
-            collections=["sentinel-2-l2a"],
-            bbox=boundary.bounds,
-            datetime=date_fmt,
-            query={"eo:cloud_cover": {"lt": max_cloud_pct}},
-            max_items=200)
-        items = list(search.items())
-
-        tile_groups = {}
-        for item in items:
-            tile = item.id.split("_")[-2]
-            tile_groups.setdefault(tile, []).append(item)
-
-        best_per_tile = []
-        for tile, its in tile_groups.items():
-            best_item = None
-            best_score = -999.0
-            best_cov = 0.0
-            best_cc = 100.0
-            for item in its:
-                cc = item.properties["eo:cloud_cover"]
-                ib = sbox(*item.bbox)
-                cov = (boundary.intersection(ib).area / boundary.area
-                       if boundary.area > 0 else 0)
-                score = cov * 100 - cc * 0.3
-                if score > best_score:
-                    best_score = score
-                    best_item = item
-                    best_cov = cov
-                    best_cc = cc
-            if best_item is None or best_cov < 0.01:
-                continue
-            best_per_tile.append({
-                "tile": tile, "item": best_item,
-                "coverage": best_cov, "cloud": best_cc
-            })
-
-        best_per_tile.sort(key=lambda x: -x["coverage"])
-        return best_per_tile
-
-    def _download_single_band(self, item, band_name, out_path):
-        asset_key = self.BAND_MAP.get(band_name, band_name)
-        asset = item.assets.get(asset_key)
-        if not asset:
-            raise ValueError(
-                f"Band '{band_name}' not found in item {item.id}")
-        with rasterio.open(asset.href) as src:
-            arr = src.read()
-            meta = src.meta.copy()
-            meta.update(
-                height=arr.shape[1], width=arr.shape[2],
-                driver="GTiff", compress="lzw")
-        if band_name != "scl":
-            # 逐景归一化基线 04.00 偏移（镶嵌前做，混合日期的瓦片也正确）
-            arr = harmonize_s2_dn(arr, s2_boa_offset(item))
-        with rasterio.open(out_path, "w", **meta) as dst:
-            dst.write(arr)
-        return out_path
-
-    def download_bands(self, scenes, out_dir, bands=None):
-        if bands is None:
-            bands = ["red", "nir"]
-        os.makedirs(out_dir, exist_ok=True)
-        result = {}
-        for band_name in bands:
-            sources = []
-            for s in scenes:
-                item = s["item"]
-                tile = s["tile"]
-                tmp_path = os.path.join(
-                    out_dir, f"tmp_{band_name}_{tile}.tif")
-                try:
-                    self._download_single_band(item, band_name, tmp_path)
-                    sources.append(tmp_path)
-                except Exception as e:
-                    print(f"    Warning: {band_name}/{tile}: {e}")
-                    continue
-            if not sources:
-                continue
-            year = item.datetime.year if hasattr(item, "datetime") else \
-                item.properties.get("datetime", "0000")[:4]
-            fname = self.FILE_NAME_MAP.get(band_name, band_name.upper())
-            out_path = os.path.join(out_dir, f"{fname}_{year}.tif")
-            if len(sources) == 1:
-                import shutil
-                shutil.move(sources[0], out_path)
-            else:
-                srcs = [rasterio.open(p) for p in sources]
-                try:
-                    mosaic_arr, mosaic_tr = merge(srcs)
-                    meta_s = srcs[0].meta.copy()
-                    meta_s.update(
-                        height=mosaic_arr.shape[1],
-                        width=mosaic_arr.shape[2],
-                        transform=mosaic_tr)
-                    with rasterio.open(out_path, "w", **meta_s) as dst:
-                        dst.write(mosaic_arr)
-                finally:
-                    for s in srcs:
-                        s.close()
-                for p in sources:
-                    if os.path.exists(p) and p != out_path:
-                        try:
-                            os.remove(p)
-                        except OSError:
-                            pass
-            result[band_name] = out_path
-        return result
-
-    def download_quality_bands(self, scenes, out_dir) -> dict[str, str]:
-        """下载 Sentinel-2 SCL (Scene Classification Layer) 质量波段。"""
-        return _download_scl_generic(scenes, out_dir, self._download_single_band)
+    def _postprocess(self, item, band_name, arr):
+        if band_name == "scl":
+            return arr
+        # 逐景归一化基线 04.00 偏移（镶嵌前做，混合日期的瓦片也正确）
+        return harmonize_s2_dn(arr, s2_boa_offset(item))
 
 
-class LandsatDataSource:
+class LandsatDataSource(StacDataSource):
     """Landsat 8/9 Collection 2 Level-2 via Planetary Computer STAC."""
 
     name = "landsat"
+    collection = "landsat-c2-l2"
 
+    # STAC 通用名优先，兼容旧版 Bn 键
     BAND_MAP = {
-        "red": "B4", "nir": "B5", "green": "B3", "blue": "B2",
-        "swir1": "B6", "swir2": "B7",
-        "qa_pixel": "QA_PIXEL",
+        "red": ("red", "B4"), "nir": ("nir08", "B5"), "green": ("green", "B3"),
+        "blue": ("blue", "B2"), "swir1": ("swir16", "B6"), "swir2": ("swir22", "B7"),
+        "qa_pixel": ("qa_pixel", "QA_PIXEL"),
     }
 
     FILE_NAME_MAP = {
@@ -195,387 +271,50 @@ class LandsatDataSource:
         "swir1": "B6", "swir2": "B7",
     }
 
+    # QA_PIXEL bit 0 = Fill，网格外填 1
+    QUALITY_BAND = ("qa_pixel", "QA_PIXEL", 1)
+    RESOLUTION = 30.0
+    GRID_ORIGIN_OFFSET = 15.0  # C2 UTM 角点坐标 ≡ 15 (mod 30)
+
     def __init__(self, satellite="landsat-8"):
+        super().__init__()
         self.satellite = satellite
         self.name = satellite.replace("-", "")
-        self._catalog = None
 
-    def _get_catalog(self):
-        if self._catalog is None:
-            try:
-                import pystac_client
-                import planetary_computer
-            except ImportError:
-                import subprocess as sp
-                sp.run([sys.executable, "-m", "pip", "install",
-                        "pystac-client", "planetary-computer", "--quiet"],
-                       capture_output=True)
-                import pystac_client
-                import planetary_computer
-            self._catalog = pystac_client.Client.open(
-                "https://planetarycomputer.microsoft.com/api/stac/v1",
-                modifier=planetary_computer.sign_inplace)
-        return self._catalog
+    def _query(self, max_cloud_pct):
+        return {"eo:cloud_cover": {"lt": max_cloud_pct},
+                "platform": {"in": [self.satellite]}}
 
-    def get_band_aliases(self):
-        return self.BAND_MAP.copy()
+    def _tile_key(self, item):
+        p = item.properties
+        if "landsat:wrs_path" in p:
+            return f"{p['landsat:wrs_path']}_{p.get('landsat:wrs_row', '')}"
+        return item.id.split("_")[2]  # LC08_L2SP_<path><row>_...
 
-    def search_scenes(self, boundary, year, month_start=6, month_end=10,
-                      max_cloud_pct=50):
-        catalog = self._get_catalog()
-        date_fmt = f"{year}-{month_start:02d}-01/{year}-{month_end:02d}-{_last_day_of_month(year, month_end):02d}"
-        search = catalog.search(
-            collections=["landsat-c2-l2"],
-            bbox=boundary.bounds,
-            datetime=date_fmt,
-            query={
-                "eo:cloud_cover": {"lt": max_cloud_pct},
-                "platform": {"in": [self.satellite]},
-            },
-            max_items=200)
-        items = list(search.items())
-
-        tile_groups = {}
-        for item in items:
-            wrs_path = item.properties.get(
-                "landsat:wrs_path", item.id.split("_")[2][:3])
-            wrs_row = item.properties.get(
-                "landsat:wrs_row", item.id.split("_")[2][3:])
-            tile = f"{wrs_path}_{wrs_row}"
-            tile_groups.setdefault(tile, []).append(item)
-
-        best_per_tile = []
-        for tile, its in tile_groups.items():
-            best_item = None
-            best_score = -999.0
-            best_cov = 0.0
-            best_cc = 100.0
-            for item in its:
-                cc = item.properties.get("eo:cloud_cover", 50)
-                ib = sbox(*item.bbox)
-                cov = (boundary.intersection(ib).area / boundary.area
-                       if boundary.area > 0 else 0)
-                score = cov * 100 - cc * 0.3
-                if score > best_score:
-                    best_score = score
-                    best_item = item
-                    best_cov = cov
-                    best_cc = cc
-            if best_item is None or best_cov < 0.01:
-                continue
-            best_per_tile.append({
-                "tile": tile, "item": best_item,
-                "coverage": best_cov, "cloud": best_cc
-            })
-
-        best_per_tile.sort(key=lambda x: -x["coverage"])
-        return best_per_tile
-
-    def _download_single_band(self, item, band_name, out_path):
-        asset_key = self.BAND_MAP.get(band_name, band_name)
-        asset = item.assets.get(asset_key)
-        if not asset:
-            raise ValueError(
-                f"Band '{band_name}' not found in item {item.id}")
-        with rasterio.open(asset.href) as src:
-            arr = src.read()
-            meta = src.meta.copy()
-            meta.update(
-                height=arr.shape[1], width=arr.shape[2],
-                driver="GTiff", compress="lzw")
-        with rasterio.open(out_path, "w", **meta) as dst:
-            dst.write(arr)
-        return out_path
-
-    def download_bands(self, scenes, out_dir, bands=None):
-        if bands is None:
-            bands = ["red", "nir"]
-        os.makedirs(out_dir, exist_ok=True)
-        result = {}
-        for band_name in bands:
-            sources = []
-            for s in scenes:
-                item = s["item"]
-                tile = s["tile"]
-                tmp_path = os.path.join(
-                    out_dir, f"tmp_{band_name}_{tile}.tif")
-                try:
-                    self._download_single_band(item, band_name, tmp_path)
-                    sources.append(tmp_path)
-                except Exception as e:
-                    print(f"    Warning: {band_name}/{tile}: {e}")
-                    continue
-            if not sources:
-                continue
-            year = scenes[0]["item"].datetime.year if scenes else 0
-            fname = self.FILE_NAME_MAP.get(band_name, band_name.upper())
-            out_path = os.path.join(out_dir, f"{fname}_{year}.tif")
-            if len(sources) == 1:
-                import shutil
-                shutil.move(sources[0], out_path)
-            else:
-                srcs = [rasterio.open(p) for p in sources]
-                try:
-                    mosaic_arr, mosaic_tr = merge(srcs)
-                    meta_s = srcs[0].meta.copy()
-                    meta_s.update(
-                        height=mosaic_arr.shape[1],
-                        width=mosaic_arr.shape[2],
-                        transform=mosaic_tr)
-                    with rasterio.open(out_path, "w", **meta_s) as dst:
-                        dst.write(mosaic_arr)
-                finally:
-                    for s in srcs:
-                        s.close()
-                for p in sources:
-                    if os.path.exists(p) and p != out_path:
-                        try:
-                            os.remove(p)
-                        except OSError:
-                            pass
-            result[band_name] = out_path
-        return result
-
-    def download_quality_bands(self, scenes, out_dir) -> dict[str, str]:
-        """下载 Landsat QA_PIXEL 质量波段。"""
-        return _download_qa_pixel_generic(scenes, out_dir, self._download_single_band)
+    def _cloud(self, item):
+        return item.properties.get("eo:cloud_cover", 50)
 
 
-class Sentinel1DataSource:
-    """Sentinel-1 GRD C-SAR via Planetary Computer STAC."""
+class Sentinel1DataSource(StacDataSource):
+    """Sentinel-1 GRD C-SAR via Planetary Computer STAC（实验性，暂无光学指数）。"""
 
     name = "sentinel1"
+    collection = "sentinel-1-grd"
 
+    BAND_MAP = {"vv": ("vv", "VV"), "vh": ("vh", "VH")}
     FILE_NAME_MAP = {"vv": "VV", "vh": "VH"}
 
-    def __init__(self):
-        self._catalog = None
+    def _query(self, max_cloud_pct):
+        return {"sar:polarizations": {"contains": "VV"}}
 
-    def _get_catalog(self):
-        if self._catalog is None:
-            try:
-                import pystac_client
-                import planetary_computer
-            except ImportError:
-                import subprocess as sp
-                sp.run([sys.executable, "-m", "pip", "install",
-                        "pystac-client", "planetary-computer", "--quiet"],
-                       capture_output=True)
-                import pystac_client
-                import planetary_computer
-            self._catalog = pystac_client.Client.open(
-                "https://planetarycomputer.microsoft.com/api/stac/v1",
-                modifier=planetary_computer.sign_inplace)
-        return self._catalog
+    def _tile_key(self, item):
+        return item.properties.get("sat:orbit_state", "unknown")
 
-    def get_band_aliases(self):
-        return {"vv": "vv", "vh": "vh"}
+    def _cloud(self, item):
+        return 0
 
-    def search_scenes(self, boundary, year, month_start=6, month_end=10,
-                      max_cloud_pct=50):
-        catalog = self._get_catalog()
-        date_fmt = f"{year}-{month_start:02d}-01/{year}-{month_end:02d}-{_last_day_of_month(year, month_end):02d}"
-        search = catalog.search(
-            collections=["sentinel-1-grd"],
-            bbox=boundary.bounds,
-            datetime=date_fmt,
-            query={"sar:polarizations": {"contains": "VV"}},
-            max_items=200)
-        items = list(search.items())
-
-        orbit_groups = {}
-        for item in items:
-            orbit = item.properties.get("sat:orbit_state", "unknown")
-            orbit_groups.setdefault(orbit, []).append(item)
-
-        best_per_orbit = []
-        for orbit, its in orbit_groups.items():
-            best_item = None
-            best_cov = 0.0
-            for item in its:
-                ib = sbox(*item.bbox)
-                cov = (boundary.intersection(ib).area / boundary.area
-                       if boundary.area > 0 else 0)
-                if cov > best_cov:
-                    best_cov = cov
-                    best_item = item
-            if best_item and best_cov > 0.01:
-                best_per_orbit.append({
-                    "tile": orbit, "item": best_item,
-                    "coverage": best_cov, "cloud": 0
-                })
-
-        best_per_orbit.sort(key=lambda x: -x["coverage"])
-        return best_per_orbit
-
-    def _download_single_band(self, item, band_name, out_path):
-        asset = item.assets.get(band_name.upper())
-        if not asset:
-            raise ValueError(
-                f"Polarization '{band_name}' not found in item {item.id}")
-        with rasterio.open(asset.href) as src:
-            arr = src.read()
-            meta = src.meta.copy()
-            meta.update(
-                height=arr.shape[1], width=arr.shape[2],
-                driver="GTiff", compress="lzw")
-        with rasterio.open(out_path, "w", **meta) as dst:
-            dst.write(arr)
-        return out_path
-
-    def download_bands(self, scenes, out_dir, bands=None):
-        if bands is None:
-            bands = ["vv", "vh"]
-        os.makedirs(out_dir, exist_ok=True)
-        result = {}
-        for band_name in bands:
-            sources = []
-            for s in scenes:
-                item = s["item"]
-                tile = s["tile"]
-                tmp_path = os.path.join(
-                    out_dir, f"tmp_{band_name}_{tile}.tif")
-                try:
-                    self._download_single_band(item, band_name, tmp_path)
-                    sources.append(tmp_path)
-                except Exception as e:
-                    print(f"    Warning: {band_name}/{tile}: {e}")
-                    continue
-            if not sources:
-                continue
-            year = scenes[0]["item"].datetime.year if scenes else 0
-            fname = self.FILE_NAME_MAP.get(band_name, band_name.upper())
-            out_path = os.path.join(out_dir, f"{fname}_{year}.tif")
-            if len(sources) == 1:
-                import shutil
-                shutil.move(sources[0], out_path)
-            else:
-                srcs = [rasterio.open(p) for p in sources]
-                try:
-                    mosaic_arr, mosaic_tr = merge(srcs)
-                    meta_s = srcs[0].meta.copy()
-                    meta_s.update(
-                        height=mosaic_arr.shape[1],
-                        width=mosaic_arr.shape[2],
-                        transform=mosaic_tr)
-                    with rasterio.open(out_path, "w", **meta_s) as dst:
-                        dst.write(mosaic_arr)
-                finally:
-                    for s in srcs:
-                        s.close()
-                for p in sources:
-                    if os.path.exists(p) and p != out_path:
-                        try:
-                            os.remove(p)
-                        except OSError:
-                            pass
-            result[band_name] = out_path
-        return result
-
-    def download_quality_bands(self, scenes, out_dir) -> dict[str, str]:
-        """Sentinel-1 无质量波段。"""
-        return {}
-
-
-# ============================================================================
-#  通用质量波段下载辅助函数
-# ============================================================================
-
-def _download_scl_generic(scenes, out_dir, download_fn) -> dict[str, str]:
-    """下载 Sentinel-2 SCL (Scene Classification Layer) 质量波段。
-
-    Args:
-        scenes: 场景列表
-        out_dir: 输出目录
-        download_fn: _download_single_band 方法引用
-
-    Returns:
-        {"scl": scl_path} 或空字典
-    """
-    scl_sources = []
-    for s in scenes:
-        item = s["item"]
-        tile = s["tile"]
-        tmp_path = os.path.join(out_dir, f"tmp_SCL_{tile}.tif")
-        try:
-            download_fn(item, "scl", tmp_path)
-            scl_sources.append((tmp_path, tile))
-        except Exception as e:
-            print(f"    Warning: SCL/{tile}: {e}")
-            continue
-    if not scl_sources:
-        return {}
-    year = scenes[0]["item"].datetime.year if scenes else 0
-    out_path = os.path.join(out_dir, f"SCL_{year}.tif")
-    if len(scl_sources) == 1:
-        import shutil
-        shutil.move(scl_sources[0][0], out_path)
-    else:
-        srcs = [rasterio.open(p) for p, _ in scl_sources]
-        try:
-            mosaic_arr, mosaic_tr = merge(srcs)
-            meta_s = srcs[0].meta.copy()
-            meta_s.update(height=mosaic_arr.shape[1],
-                          width=mosaic_arr.shape[2],
-                          transform=mosaic_tr)
-            with rasterio.open(out_path, "w", **meta_s) as dst:
-                dst.write(mosaic_arr)
-        finally:
-            for s in srcs:
-                s.close()
-        for p, _ in scl_sources:
-            if os.path.exists(p) and p != out_path:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-    return {"scl": out_path}
-
-
-def _download_qa_pixel_generic(scenes, out_dir, download_fn) -> dict[str, str]:
-    """下载 Landsat QA_PIXEL 质量波段。
-
-    Returns:
-        {"qa_pixel": qa_path} 或空字典
-    """
-    qa_sources = []
-    for s in scenes:
-        item = s["item"]
-        tile = s["tile"]
-        tmp_path = os.path.join(out_dir, f"tmp_QA_PIXEL_{tile}.tif")
-        try:
-            download_fn(item, "qa_pixel", tmp_path)
-            qa_sources.append((tmp_path, tile))
-        except Exception as e:
-            print(f"    Warning: QA_PIXEL/{tile}: {e}")
-            continue
-    if not qa_sources:
-        return {}
-    year = scenes[0]["item"].datetime.year if scenes else 0
-    out_path = os.path.join(out_dir, f"QA_PIXEL_{year}.tif")
-    if len(qa_sources) == 1:
-        import shutil
-        shutil.move(qa_sources[0][0], out_path)
-    else:
-        srcs = [rasterio.open(p) for p, _ in qa_sources]
-        try:
-            mosaic_arr, mosaic_tr = merge(srcs)
-            meta_s = srcs[0].meta.copy()
-            meta_s.update(height=mosaic_arr.shape[1],
-                          width=mosaic_arr.shape[2],
-                          transform=mosaic_tr)
-            with rasterio.open(out_path, "w", **meta_s) as dst:
-                dst.write(mosaic_arr)
-        finally:
-            for s in srcs:
-                s.close()
-        for p, _ in qa_sources:
-            if os.path.exists(p) and p != out_path:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-    return {"qa_pixel": out_path}
+    def download_bands(self, scenes, out_dir, bands=None, boundary=None):
+        return super().download_bands(scenes, out_dir, bands or ["vv", "vh"], boundary)
 
 
 def get_data_source(name):

@@ -1,17 +1,14 @@
 """
-DatasetSnapshot — 数据快照缓存系统
+数据快照缓存系统
 
-缓存键内容:
-  - AOI 几何哈希 (WGS84, 保留8位小数)
-  - STAC item IDs (按时间排序，拼接)
-  - 数据源与处理级别
-  - 日期范围 (year, month_start, month_end)
-  - 云阈值
-  - 波段列表
-  - 目标网格 (CRS + transform + width/height)
-  - 合成方法
-
-替换原 DataCache: 缓存对象是「数据快照」而非几个文件路径。
+缓存单位是「单期快照」：一个 AOI 在一个年份 / 月份范围 / 云量阈值下，
+按确定性分析网格下载的原始 DN 波段与质量波段。缓存键内容:
+  - AOI 几何哈希
+  - 数据源（landsat8 / landsat9 分开）
+  - 年份与月份范围
+  - 云量阈值
+  - 波段列表（查找时允许超集）
+  - 预处理版本（版本变化时旧缓存失效）
 """
 
 from __future__ import annotations
@@ -19,11 +16,10 @@ import dataclasses
 import hashlib
 import json
 import os
-import time
 import typing as T
 
 if T.TYPE_CHECKING:
-    from numpy.typing import NDArray
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,15 +95,22 @@ class DatasetSnapshot:
         }
 
 
+PERIOD_KIND = "period"
+
+
 class SnapshotCache:
-    """数据快照持久化缓存管理器。
+    """单期影像快照的持久化缓存。
+
+    一个条目 = 一个时相（AOI / 数据源 / 年份 / 月份 / 云量 / 波段 / 预处理版本），
+    变化检测（两期）、地物分类（一期）与时间序列（多期）共用：
+    同一时相下载过一次，各模块都能复用，波段为所需波段的超集即可。
 
     缓存的结构:
         data/cache/<cache_key>/
-            snapshot.json          # DatasetSnapshot 元数据
+            snapshot.json          # 元数据（kind="period"）
             .collected             # 标记文件：收集完成
-            Y1_band_<name>.tif     # 前时相波段
-            Y2_band_<name>.tif     # 后时相波段
+            <前缀>_<年份>.tif       # 原始 DN 波段，如 B4_2024.tif
+            SCL_<年份>.tif          # 质量波段（S2 SCL / Landsat QA_PIXEL）
     """
 
     def __init__(self, cache_root: str = "data/cache"):
@@ -132,41 +135,28 @@ class SnapshotCache:
         except (json.JSONDecodeError, IOError):
             return None
 
-    def find(self, aoi_hash: str, data_source: str, index_type: str,
-             year1: int, year2: int, month_start: int, month_end: int,
-             max_cloud_pct: float, bands: T.Sequence[str],
-             preprocessing_version: str | None = None) -> str | None:
-        """在现有缓存中查找匹配的快照，返回 cache_key 或 None。
+    def find_period(self, aoi_hash: str, data_source: str, year: int,
+                    month_start: int, month_end: int, max_cloud_pct: float,
+                    bands: T.Sequence[str], preprocessing_version: str) -> str | None:
+        """查找已完整收集、波段包含 bands 的单期快照，返回 cache_key 或 None。
 
-        遍历所有缓存目录，找到完全匹配的条目。
-        preprocessing_version 非 None 时还要求预处理版本一致（旧缓存自动失效）。
+        多个条目都满足时取波段最少的（再按 key 排序），结果确定。
+        预处理版本不同的旧缓存自动失效。
         """
-        if not os.path.exists(self.root):
-            return None
-        for entry_name in os.listdir(self.root):
-            ep = os.path.join(self.root, entry_name)
-            sp = os.path.join(ep, "snapshot.json")
-            if not os.path.exists(sp):
-                continue
-            try:
-                with open(sp, "r", encoding="utf-8") as f:
-                    snap = json.load(f)
-            except Exception:
-                continue
-            if (snap.get("aoi_hash") == aoi_hash
+        matches = []
+        for snap in self.list_entries():
+            if (snap["collected"]
+                    and snap.get("kind") == PERIOD_KIND
+                    and snap.get("aoi_hash") == aoi_hash
                     and snap.get("data_source") == data_source
-                    and snap.get("index_type") == index_type
-                    and snap.get("year1") == year1
-                    and snap.get("year2") == year2
-                    and snap.get("month_start") == month_start
-                    and snap.get("month_end") == month_end
+                    and snap.get("year") == int(year)
+                    and snap.get("month_start") == int(month_start)
+                    and snap.get("month_end") == int(month_end)
                     and snap.get("max_cloud_pct") == max_cloud_pct
-                    and set(snap.get("bands", [])) == set(bands)
-                    and (preprocessing_version is None
-                         or snap.get("preprocessing_version") == preprocessing_version)):
-                if self.has(entry_name):
-                    return entry_name
-        return None
+                    and set(bands) <= set(snap.get("bands", []))
+                    and snap.get("preprocessing_version") == preprocessing_version):
+                matches.append((len(snap.get("bands", [])), snap["cache_key"]))
+        return min(matches)[1] if matches else None
 
     def put_snapshot(self, key: str, snapshot: dict) -> None:
         """保存快照元数据。"""
@@ -215,14 +205,12 @@ class SnapshotCache:
 from pathlib import Path
 
 
-def snapshot_key(aoi_hash: str, data_source: str, index_type: str,
-                 year1: int, year2: int, month_start: int, month_end: int,
-                 max_cloud_pct: float, bands: T.Sequence[str],
-                 preprocessing_version: str) -> str:
-    """由 find() 的全部匹配字段生成缓存目录名，参数不同的快照互不覆盖。"""
+def period_key(aoi_hash: str, data_source: str, year: int,
+               month_start: int, month_end: int, max_cloud_pct: float,
+               bands: T.Sequence[str], preprocessing_version: str) -> str:
+    """由单期快照的全部匹配字段生成缓存目录名，参数不同的快照互不覆盖。"""
     raw = "|".join([
-        aoi_hash, data_source, index_type,
-        str(int(year1)), str(int(year2)),
+        PERIOD_KIND, aoi_hash, data_source, str(int(year)),
         str(int(month_start)), str(int(month_end)),
         str(max_cloud_pct), ",".join(sorted(bands)),
         preprocessing_version,

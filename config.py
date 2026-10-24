@@ -21,8 +21,6 @@ YEAR2 = 2026                     # 后时相年份
 MONTH_START = 6                  # 起始月份
 MONTH_END = 10                   # 结束月份
 
-# v3 新增: 时间序列分析用年份范围
-YEAR_RANGE = [2020, 2021, 2022, 2023, 2024, 2025, 2026]
 
 # ============================================================================
 #  数据源设置 (v3 新增)
@@ -32,7 +30,6 @@ YEAR_RANGE = [2020, 2021, 2022, 2023, 2024, 2025, 2026]
 DATA_SOURCE = "sentinel2"
 
 MAX_CLOUD_PCT = 50               # 最大云量百分比
-MIN_TILE_COVERAGE = 0.01         # 瓦片最小覆盖比例
 
 # ============================================================================
 #  遥感指数选择 (v3 新增)
@@ -91,61 +88,32 @@ MIN_CHANGE_AREA_PX = max(1, MIN_CHANGE_AREA_M2 // 100)
 
 NUM_SAMPLE_POINTS = None          # 采样数量上限 (None=不限)
 MIN_POINT_DISTANCE_M = None       # 采样点最小间距 (m) (None=不限)
-SAMPLE_STRATEGY = "centroid"      # 策略: centroid | random | grid
 
 # ============================================================================
 #  输出设置
 # ============================================================================
 
 OUTPUT_DIR = "output"
-SAMPLE_OUTPUT = "sample_points.geojson"
 OUTPUT_FORMATS = "geojson,csv"    # geojson | csv | shp (逗号分隔)
 GENERATE_REPORT = True
 
-# v3 新增: 报告格式
-REPORT_FORMATS = "png,pdf"        # png | pdf | docx | html | all
-REPORT_TEMPLATE = "reports/template_report.md"
-
-# ============================================================================
-#  时间序列参数 (v3 新增)
-# ============================================================================
-
-TREND_PERIOD = 5                  # 分析周期 (年)
-TREND_CONFIDENCE = 0.95           # 趋势置信度
 
 # ============================================================================
 #  批量处理参数 (v3 新增)
 # ============================================================================
 
-BATCH_CONFIG = "batch/batch_config.json"
 
-# ============================================================================
-#  性能优化
-# ============================================================================
+# 后台任务：同时运行的任务数（每个任务一个工作进程；环境变量 RSAP_JOB_WORKERS 可覆盖）
+JOB_MAX_WORKERS = 2
 
-PARALLEL_DOWNLOADS = False
-MAX_PARALLEL_WORKERS = 4
 
 # ============================================================================
 #  地物分类参数 (v3 新增，合并自地物分类器)
 # ============================================================================
 
-# GMM 聚类
-N_CLUSTERS = 6                    # GMM 聚类数
-PCA_SAMPLE_RATIO = 0.05           # PCA 拟合采用比例（大影像节省内存）
 
-# 多指数阈值分类
-CLASSIFIER_MNDWI_THRESHOLD = 0.0  # MNDWI > 此值 → 水体
-CLASSIFIER_NDVI_HIGH = 0.3        # NDVI > 此值 → 植被
-CLASSIFIER_NDVI_LOW = 0.1         # NDVI < 此值 → 低植被
-CLASSIFIER_NDBI_THRESHOLD = 0.0   # NDBI > 此值 → 建筑
-
-# 分类后处理
-CLASSIFIER_CC_FILTER = False      # 是否对分类结果做连通域过滤
 CLASSIFIER_MIN_PATCH_PX = 100     # 连通域最小像元数
 
-# 主动学习
-AL_N_SAMPLES = 200                # 不确定性采样的候选像元数
 AL_N_PATCHES = 50                 # 候选斑块数
 AL_PATCH_SIZE = 32                # 斑块大小 (px)
 AL_RF_N_ESTIMATORS = 100          # 随机森林树数

@@ -1,0 +1,22 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "示例区域（灵川县内，约 5 km × 5 km）",
+        "note": "用于快速试跑与演示；面积小，下载量约数十 MB"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [110.30, 25.400],
+          [110.35, 25.400],
+          [110.35, 25.445],
+          [110.30, 25.445],
+          [110.30, 25.400]
+        ]]
+      }
+    }
+  ]
+}
