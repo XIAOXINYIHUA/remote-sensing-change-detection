@@ -1,7 +1,7 @@
 """
 遥感分析平台 v3 — 前端共享工具函数
 
-包含: 新手引导, 全局CSS, 地图工具, 边界工具, 字体配置, 常量
+包含: 全局CSS, 地图工具, 边界工具, 字体配置, 常量
 """
 
 import os
@@ -10,7 +10,6 @@ import json
 from pathlib import Path
 
 import streamlit as st
-import matplotlib
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 from shapely.geometry import shape
@@ -18,31 +17,8 @@ import requests
 
 
 # ============================================================================
-#  新手引导 & 全局 CSS
+#  全局 CSS
 # ============================================================================
-
-GUIDE_STEPS = [
-    {"title": "选择地区", "desc": "选择已有 GeoJSON 边界文件，或搜索城市名称自动获取"},
-    {"title": "设定时相", "desc": "选择前/后时相的年份和月份范围（建议6-10月生长季）"},
-    {"title": "收集资料", "desc": "自动搜索并下载覆盖区域的多光谱卫星影像"},
-    {"title": "运行分析", "desc": "一键运行变化检测，查看分级结果地图和统计"},
-    {"title": "导出成果", "desc": "下载采样点、报告图和矢量数据"},
-]
-
-
-def show_guide():
-    """首次使用时显示新手引导。"""
-    if "guide_shown" not in st.session_state:
-        with st.expander("新手引导（点击展开）", expanded=True):
-            st.markdown("### 遥感分析平台 v3 — 快速上手")
-            for i, step in enumerate(GUIDE_STEPS, 1):
-                st.markdown(f"**Step {i}**: {step['title']}  — {step['desc']}")
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            if st.button("我知道了，开始使用", type="primary"):
-                st.session_state.guide_shown = True
-                st.rerun()
-
 
 def inject_global_css():
     """Inject the shared workbench visual system."""
@@ -744,6 +720,10 @@ CAPABILITY_MATRIX = {
     "sentinel1": [],  # 需要 VV/VH 指数（RVI 等），暂未实现
 }
 
+# 界面可选的分析数据源：只列出至少有一个可用指数的数据源，
+# 否则选中后无法收集影像也无法运行分析
+ANALYSIS_SOURCES = [src for src in DATA_SOURCE_LABELS if CAPABILITY_MATRIX.get(src)]
+
 MODE_LABELS = {
     "multi": "多级分级（推荐）",
     "binary": "二值检测",
@@ -755,22 +735,12 @@ MODE_LABELS = {
 #  状态持久化
 # ============================================================================
 
-def save_app_state(state_file, state_dict):
-    """保存应用状态到 JSON 文件。"""
-    try:
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state_dict, f, ensure_ascii=False)
-    except Exception:
-        pass
+def state_dir():
+    """界面状态文件（项目状态 .project_state.json）所在目录。
 
-
-def load_app_state(state_file, keys):
-    """从 JSON 文件加载应用状态。"""
-    if not os.path.exists(state_file):
-        return {}
-    try:
-        with open(state_file, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        return {k: state[k] for k in keys if k in state and state[k] is not None}
-    except Exception:
-        return {}
+    默认为项目根目录；设置环境变量 RSAP_STATE_DIR 可改到别处
+    （测试用临时目录，避免改动用户的工作状态）。
+    """
+    root = Path(os.environ.get("RSAP_STATE_DIR") or Path(__file__).resolve().parent.parent)
+    root.mkdir(parents=True, exist_ok=True)
+    return root

@@ -16,7 +16,7 @@
     python tests/test_phase0.py
 """
 
-import os, sys, json, tempfile, shutil
+import os, sys, tempfile, shutil
 import numpy as np
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -224,7 +224,7 @@ def test_preprocessing_mask():
     scaled = apply_scale_factors(bands, "sentinel2")
     assert "red" in scaled
     assert scaled["red"].max() <= 0.5
-    print(f"  [OK] test_preprocessing_mask: saturation and scaling work")
+    print("  [OK] test_preprocessing_mask: saturation and scaling work")
 
 
 def test_ece():
@@ -252,7 +252,7 @@ def test_spatial_kfold():
         assert len(train_idx) > 0
         assert len(val_idx) > 0
         assert not set(train_idx) & set(val_idx), "Train/val should not overlap"
-    print(f"  [OK] test_spatial_kfold: 3 folds, no overlap")
+    print("  [OK] test_spatial_kfold: 3 folds, no overlap")
 
 
 def test_reject_low_confidence():
@@ -265,7 +265,7 @@ def test_reject_low_confidence():
     assert result[0, 1] == 0  # rejected
     assert result[1, 0] == 0  # rejected
     assert result[1, 2] == 0  # rejected
-    print(f"  [OK] test_reject_low_confidence: rejection works")
+    print("  [OK] test_reject_low_confidence: rejection works")
 
 
 # ============================================================================
@@ -281,23 +281,26 @@ def test_snapshot_cache():
         assert not sc.has("nonexistent")
 
         snap = {
+            "kind": "period",
             "aoi_hash": "abc123",
             "data_source": "sentinel2",
-            "index_type": "NDVI",
-            "year1": 2025, "year2": 2026,
+            "year": 2025,
             "month_start": 6, "month_end": 10,
             "max_cloud_pct": 50,
             "bands": ["red", "nir"],
+            "preprocessing_version": "v3.2",
         }
         sc.put_snapshot("testkey", snap)
+        assert sc.find_period("abc123", "sentinel2", 2025, 6, 10, 50,
+                              ["red", "nir"], "v3.2") is None, "未完成收集不应命中"
         sc.mark_complete("testkey")
         assert sc.has("testkey")
         assert sc.get_snapshot("testkey") is not None
 
-        # find 应匹配
-        found = sc.find("abc123", "sentinel2", "NDVI",
-                        2025, 2026, 6, 10, 50, ["red", "nir"])
+        # find_period 应匹配（波段为子集也命中）
+        found = sc.find_period("abc123", "sentinel2", 2025, 6, 10, 50, ["nir"], "v3.2")
         assert found == "testkey", f"Expected testkey, got {found}"
+        assert sc.find_period("abc123", "sentinel2", 2026, 6, 10, 50, ["nir"], "v3.2") is None
 
         print("  [OK] test_snapshot_cache: store/find/has works")
     finally:
@@ -343,7 +346,6 @@ def test_pca_gmm_with_standardization():
 
 def test_export_no_random_drop():
     """分类矢量导出不应随机丢弃。"""
-    from engine.classifier import CLASS_NAMES, CLASS_COLORS
     from warnings import filterwarnings
     filterwarnings("ignore")
 
@@ -351,7 +353,6 @@ def test_export_no_random_drop():
     from collections import defaultdict
     from shapely.geometry import shape as shp_shape, mapping as shp_mapping
     from shapely.ops import unary_union
-    import json
 
     # 模拟大于 50000 的情况
     n_feats = 60000

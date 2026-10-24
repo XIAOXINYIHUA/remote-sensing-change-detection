@@ -26,6 +26,32 @@ sys.path.insert(0, BASE_DIR)
 from engine.utils import log
 
 
+def task_params(task, boundary_file=None):
+    """把任务字段映射为 RunParams（未指定的沿用 config 默认值；参数错误抛 ValueError）。
+
+    每个任务持有独立的 RunParams，不修改全局 config，任务之间互不污染。
+    """
+    from engine.params import RunParams
+    return RunParams.from_config(
+        region=task.get("region"),
+        boundary_file=boundary_file or task.get("boundary"),
+        year1=task.get("year1"), year2=task.get("year2"),
+        month_start=task.get("month_start"), month_end=task.get("month_end"),
+        data_source=task.get("data_source"),
+        index_type=task.get("index_type"),
+        detection_mode=task.get("detection_mode"),
+        max_cloud_pct=task.get("max_cloud_pct"),
+        threshold=task.get("threshold"),
+        severe_threshold=task.get("severe_threshold"),
+        adaptive_threshold=task.get("adaptive_threshold"),
+        min_area_m2=task.get("min_area_m2"),
+        num_sample_points=task.get("sample_points"),
+        min_point_distance_m=task.get("min_point_distance_m"),
+        output_formats=task.get("formats"),
+        generate_report=task.get("report"),
+    )
+
+
 class BatchRunner:
     """批量任务运行器 — 每个任务独立配置。"""
 
@@ -121,41 +147,15 @@ class BatchRunner:
             try:
                 log(f"\n[{task_idx}/{total}] {task_id} (attempt {attempt + 1})")
 
-                # 每个任务创建一个独立配置对象
-                import copy, config as cfg
-                task_cfg = copy.copy(cfg)
-
-                task_cfg.REGION_NAME = task.get("region", cfg.REGION_NAME)
-                task_cfg.BOUNDARY_FILE = boundary_file
-                task_cfg.YEAR1 = task.get("year1", cfg.YEAR1)
-                task_cfg.YEAR2 = task.get("year2", cfg.YEAR2)
-                task_cfg.MONTH_START = task.get("month_start", cfg.MONTH_START)
-                task_cfg.MONTH_END = task.get("month_end", cfg.MONTH_END)
-                task_cfg.DETECTION_MODE = task.get("detection_mode", cfg.DETECTION_MODE)
-                task_cfg.INDEX_TYPE = task.get("index_type", getattr(cfg, 'INDEX_TYPE', 'NDVI'))
-                task_cfg.DATA_SOURCE = task.get("data_source", cfg.DATA_SOURCE)
-                task_cfg.CHANGE_THRESHOLD = task.get("threshold", cfg.CHANGE_THRESHOLD)
-                task_cfg.OUTPUT_FORMATS = task.get("formats", cfg.OUTPUT_FORMATS)
-                task_cfg.GENERATE_REPORT = task.get("report", cfg.GENERATE_REPORT)
-
-                # 暂时写入全局 config（兼容 run_pipeline_v3 读取方式）
-                import config
-                for attr in dir(task_cfg):
-                    if not attr.startswith("_"):
-                        setattr(config, attr, getattr(task_cfg, attr))
-
+                params = task_params(task, boundary_file)
                 out_dir = os.path.join(
                     BASE_DIR, self.configs.get("output_base", "output"), task_id)
-                data_dir = os.path.join(BASE_DIR, "data", task_cfg.REGION_NAME or task_id)
+                data_dir = os.path.join(BASE_DIR, "data", params.region or task_id)
 
                 from engine.core import run_pipeline_v3
-                r = run_pipeline_v3(
-                    data_source_name=task_cfg.DATA_SOURCE,
-                    data_dir=data_dir,
-                    out_dir=out_dir,
-                    index_type=task_cfg.INDEX_TYPE,
-                    detection_mode=task_cfg.DETECTION_MODE,
-                )
+                r = run_pipeline_v3(params=params, data_dir=data_dir, out_dir=out_dir)
+                if r.get("error"):
+                    raise RuntimeError(r["error"])
 
                 elapsed = time.time() - t0
                 r["task_id"] = task_id
@@ -166,6 +166,11 @@ class BatchRunner:
                 log(f"  ✅ {task_id} — {elapsed:.0f}s")
                 return r
 
+            except ValueError as e:
+                # 参数错误重试也不会成功
+                log(f"  ❌ {task_id} 参数无效: {e}")
+                result["error"] = str(e)
+                break
             except Exception as e:
                 elapsed = time.time() - t0
                 log(f"  ❌ {task_id} attempt {attempt + 1} failed: {e}")
@@ -211,7 +216,7 @@ class BatchRunner:
 
     def _summary(self, results):
         log(f"\n{'='*60}")
-        log(f"  Batch Summary")
+        log("  Batch Summary")
         log(f"{'='*60}")
         success = [r for r in results if r.get("status") == "success"]
         failed = [r for r in results if r.get("status") == "failed"]

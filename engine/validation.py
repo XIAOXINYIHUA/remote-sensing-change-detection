@@ -72,7 +72,6 @@ def spatial_kfold_split(
              每个索引是 (N,) 的 1D 索引数组
     """
     blocks = spatial_blocks(labels.shape, n_blocks=n_folds)
-    total_pixels = labels.shape[0] * labels.shape[1]
 
     folds = []
     for val_block_idx in range(n_folds):
@@ -150,50 +149,6 @@ def expected_calibration_error(
         "accuracy": float(correct.mean()),
         "bins": bins_info,
     }
-
-
-# ============================================================================
-#  置信度校准
-# ============================================================================
-
-def platt_scale(
-    logits: np.ndarray,
-    labels: np.ndarray,
-    max_iter: int = 100,
-) -> tuple[float, float]:
-    """Platt 缩放（逻辑回归校准），用于二分类。
-
-    训练参数 a, b 使得:
-        P(y=1|x) = 1 / (1 + exp(a * logit + b))
-
-    Args:
-        logits: (N,) 模型输出 logits
-        labels: (N,) 真实标签 {0, 1}
-        max_iter: 最大迭代
-
-    Returns:
-        (a, b) 校准参数
-    """
-    from scipy.optimize import minimize
-
-    def _neg_log_likelihood(params):
-        a, b = params
-        p = 1.0 / (1.0 + np.exp(-(a * logits + b)))
-        p = np.clip(p, 1e-15, 1 - 1e-15)
-        return -np.sum(labels * np.log(p) + (1 - labels) * np.log(1 - p))
-
-    result = minimize(
-        _neg_log_likelihood,
-        x0=[1.0, 0.0],
-        method="L-BFGS-B",
-        options={"maxiter": max_iter},
-    )
-    return float(result.x[0]), float(result.x[1])
-
-
-def apply_platt_scale(logits: np.ndarray, a: float, b: float) -> np.ndarray:
-    """应用 Platt 缩放。"""
-    return 1.0 / (1.0 + np.exp(-(a * logits + b)))
 
 
 # ============================================================================

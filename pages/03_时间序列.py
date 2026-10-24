@@ -7,7 +7,7 @@
   年际变化可视化
 """
 
-import os, sys, json, time, warnings
+import os, sys, warnings
 warnings.filterwarnings("ignore")
 
 _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,14 +30,16 @@ if str(Path(_base)) not in sys.path:
     sys.path.insert(0, str(_base))
 
 import config
+from services import timeseries as ts_svc
 from frontend.utils import (
     setup_matplotlib_font,
-    detect_region, slug as _slug,
-    load_gj, fetch_boundary_osm,
-    DATA_SOURCE_LABELS, INDEX_HELP,
-    save_app_state, load_app_state,
+    DATA_SOURCE_LABELS,
 )
 from frontend.project_state import ProjectState
+from frontend.components import jobs as jobs_ui
+from frontend.components.sidebar import (
+    data_source_picker, index_picker, month_range, region_picker, year_series,
+)
 from frontend.components.ui import (
     empty_state,
     page_header,
@@ -55,44 +57,40 @@ setup_matplotlib_font()
 # =====================================================================
 
 S = st.session_state
+JOB_TS = "ts_job"
 
-# 从 ProjectState 初始化
+# 分析区域以项目为准（任何页面的侧栏或向导切换区域都写入项目状态）
 ps = ProjectState.get()
-if ps.is_ready():
-    S.setdefault("ts_boundary", ps.boundary)
-    S.setdefault("ts_region", ps.region)
-    S.setdefault("ts_slug", ps.slug)
+S.ts_boundary, S.ts_region, S.ts_slug = ps.boundary or None, ps.region or None, ps.slug or None
 
 _INIT = {
-    "ts_boundary": None,
-    "ts_region": None,
-    "ts_slug": None,
-    "ts_running": False,
     "ts_done": False,
-    "ts_error": None,
     "ts_result": None,
     "ts_years": None,
     "ts_stats_summary": None,
     "ts_trend_data": None,
+    JOB_TS: None,
 }
 for k, v in _INIT.items():
     if k not in S:
         S[k] = v
 
-STATE_FILE = Path(_base) / ".ts_state.json"
+# 区域换了：清掉属于旧区域的趋势结果，不再跟踪旧区域的任务
+if ProjectState.aoi_changed("ts"):
+    for k, v in _INIT.items():
+        S[k] = v
+    jobs_ui.forget(JOB_TS)
+
+# 状态持久化：项目状态的 ts 节（正在跟踪的任务）
+_PERSIST = [JOB_TS]
 
 
 def _save_state():
-    save_app_state(STATE_FILE, {
-        "ts_boundary": S.get("ts_boundary"),
-        "ts_region": S.get("ts_region"),
-        "ts_slug": S.get("ts_slug"),
-    })
+    ProjectState.save_page("ts", {k: S.get(k) for k in _PERSIST})
 
 
 def _load_state():
-    loaded = load_app_state(STATE_FILE, ["ts_boundary", "ts_region", "ts_slug"])
-    for k, v in loaded.items():
+    for k, v in ProjectState.load_page("ts", _PERSIST).items():
         S[k] = v
 
 
@@ -103,61 +101,33 @@ _load_state()
 #  运行分析
 # =====================================================================
 
-def _run_timeseries(boundary, years, idx_type, data_src, ms, me):
-    """全流程：收集影像 → 计算指数 → 趋势分析。"""
-    S.ts_running = True
-    S.ts_done = False
-    S.ts_error = None
+def _submit_timeseries(years, idx_type, data_src, ms, me):
+    """提交全流程任务（后台执行）：收集影像 → 计算指数 → 趋势分析。"""
+    boundary = str(Path(S.ts_boundary).resolve())
+    years = [int(y) for y in years]
+    # 影像存入 data/cache 的单期快照；data/ 下只放下载用的临时目录
+    jobs_ui.submit(JOB_TS, "ts.run", {
+        "boundary_file": boundary, "years": years, "index_type": idx_type,
+        "data_source": data_src, "month_start": int(ms), "month_end": int(me),
+        "max_cloud_pct": ProjectState.get().max_cloud_pct,
+        "data_dir": os.path.join(_base, "data"),
+    }, title=f"{S.ts_region or '未知'} · {idx_type} 趋势 {years[0]}–{years[-1]}（{len(years)} 期）",
+       meta={"page": "pages/03_时间序列.py", "region": S.ts_region, "boundary": boundary})
+    _save_state()
+    st.rerun()
 
-    prog_bar = st.progress(0)
-    status_text = st.empty()
 
-    try:
-        from engine.timeseries import TimeSeriesAnalyzer
+def _apply_timeseries(res):
+    S.ts_years = res["ts_data"]["years"]
+    S.ts_trend_data = res["trend"]
+    S.ts_stats_summary = res["summary"]
+    S.ts_result = res
+    S.ts_done = True
+    return f"有效时相 {len(S.ts_years)} 期：{'、'.join(map(str, S.ts_years))}"
 
-        status_text.info("初始化分析器...")
-        prog_bar.progress(5)
 
-        analyzer = TimeSeriesAnalyzer(boundary, data_source=data_src)
-        ts_dir = os.path.join(_base, "data", "timeseries", S.ts_slug or "default")
-        os.makedirs(ts_dir, exist_ok=True)
-
-        status_text.info(f"📥 收集 {len(years)} 期 {idx_type} 影像...")
-        prog_bar.progress(15)
-        ts_data = analyzer.collect_time_series(
-            years, index_type=idx_type,
-            month_start=ms, month_end=me,
-            data_dir=ts_dir)
-
-        S.ts_years = ts_data["years"]
-        status_text.success(f"✅ {len(ts_data['years'])} 期影像收集完成")
-        prog_bar.progress(50)
-
-        status_text.info("📊 逐像元趋势分析 (Mann-Kendall + Sen's slope)...")
-        trend = analyzer.compute_trend(ts_data)
-        prog_bar.progress(80)
-
-        status_text.info("📋 生成统计摘要...")
-        summary = analyzer.summarize(ts_data, trend)
-        prog_bar.progress(95)
-
-        S.ts_trend_data = trend
-        S.ts_stats_summary = summary
-        S.ts_result = {"ts_data": ts_data, "trend": trend, "summary": summary}
-        S.ts_done = True
-        prog_bar.progress(100)
-        status_text.success("✅ 时间序列分析完成！")
-
-    except Exception as e:
-        S.ts_error = str(e)
-        st.error(f"❌ 分析失败: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-    finally:
-        S.ts_running = False
-        time.sleep(1)
-        status_text.empty()
-        prog_bar.empty()
+running = jobs_ui.settle(JOB_TS, label="趋势分析", on_success=_apply_timeseries,
+                         persist=_save_state)
 
 
 # =====================================================================
@@ -165,76 +135,21 @@ def _run_timeseries(boundary, years, idx_type, data_src, ms, me):
 # =====================================================================
 
 sidebar_header("时间序列参数", "多年时相、数据源与趋势指数")
-st.sidebar.subheader("分析区域")
 
-exist = {f.name: str(f) for f in Path(_base).glob("*.geojson")}
-cur_name = Path(S.ts_boundary).name if S.ts_boundary else None
-if exist:
-    sel = st.sidebar.selectbox(
-        "边界文件", list(exist.keys()),
-        index=list(exist.keys()).index(cur_name) if cur_name in exist else 0)
-    chosen = exist[sel]
-    if chosen != S.ts_boundary:
-        S.ts_boundary = chosen
-        r = detect_region(chosen)
-        S.ts_region = r
-        S.ts_slug = _slug(r)
-        S.ts_done = False
-        _save_state()
-        st.rerun()
 
-sn = st.sidebar.text_input("搜索地区", "", placeholder="城市/区县名")
-if st.sidebar.button("获取边界", icon=":material/search:", use_container_width=True,
-                      disabled=not sn.strip()):
-    with st.sidebar.status(f"搜索 {sn}..."):
-        gj, err = fetch_boundary_osm(sn.strip())
-        if err:
-            st.sidebar.error(err)
-        else:
-            fp = Path(_base) / f"{_slug(sn)}.geojson"
-            with open(fp, "w", encoding="utf-8") as f:
-                json.dump(gj, f, ensure_ascii=False)
-            S.ts_boundary = str(fp)
-            S.ts_region = sn.strip()
-            S.ts_slug = _slug(sn)
-            S.ts_done = False
-            _save_state()
-            st.rerun()
-
-if S.ts_boundary and Path(S.ts_boundary).exists():
-    try:
-        _, geom = load_gj(S.ts_boundary)
-        st.sidebar.caption(f"中心: {geom.centroid.y:.3f}, {geom.centroid.x:.3f}")
-    except Exception:
-        st.sidebar.error("边界解析失败")
-else:
-    st.sidebar.error("请选择边界文件")
-
+region_picker("ts")
 st.sidebar.markdown("---")
+
 st.sidebar.subheader("时间范围")
-
-start_year = st.sidebar.number_input("起始年份", 2015, 2025, 2020, 1)
-end_year = st.sidebar.number_input("结束年份", 2016, 2026, 2026, 1)
-step = st.sidebar.selectbox("步长", [1, 2, 3], index=0)
-years = list(range(start_year, end_year + 1, step))
-if years:
-    st.sidebar.caption(f"共 {len(years)} 期: {years[0]} 至 {years[-1]}")
-else:
-    st.sidebar.error("结束年份必须晚于起始年份")
-
-ms = st.sidebar.slider("起始月份", 1, 12, 6)
-me = st.sidebar.slider("结束月份", 1, 12, 10)
-
+years, start_year, end_year, step = year_series(2020, 2026)
+ms, me = month_range(ps.month_start or config.MONTH_START, ps.month_end or config.MONTH_END)
 st.sidebar.markdown("---")
-st.sidebar.subheader("数据参数")
-data_src = st.sidebar.selectbox(
-    "数据源",
-    ["sentinel2", "landsat8", "landsat9"],
-    format_func=lambda x: DATA_SOURCE_LABELS.get(x, x))
-idx_type = st.sidebar.selectbox(
-    "遥感指数",
-    ["NDVI", "NDWI", "MNDWI", "NBR", "EVI", "SAVI"],
-    format_func=lambda x: f"{x} ({INDEX_HELP.get(x, '')})")
+
+st.sidebar.subheader("数据源与指数")
+data_src = data_source_picker(ps.data_source)
+idx_type = index_picker(data_src, default=ps.index_type,
+                        allowed=["NDVI", "NDWI", "MNDWI", "NBR", "EVI", "SAVI"],
+                        remember_as="ts_cur_idx")
 
 # =====================================================================
 #  主面板
@@ -254,29 +169,31 @@ page_header(
         "数据": source_label,
         "指数": idx_type,
     },
-    status="分析完成" if S.ts_result else "运行中" if S.ts_running else "等待执行",
-    status_tone="success" if S.ts_result else "info" if S.ts_running else "warning",
+    status="运行中" if running else "分析完成" if S.ts_result else "等待执行",
+    status_tone="info" if running else "success" if S.ts_result else "warning",
 )
 workflow_bar(
     ["配置序列", "获取影像", "趋势检验", "结果解读"],
-    active=3 if S.ts_result else 2 if S.ts_running else 0,
-    completed=[0, 1, 2] if S.ts_result else [0, 1] if S.ts_running else [],
+    active=2 if running else 3 if S.ts_result else 0,
+    completed=[0, 1] if running else [0, 1, 2] if S.ts_result else [],
 )
 
-valid_period = bool(years) and len(years) >= 3 and end_year >= start_year and me >= ms
+valid_period = len(years) >= ts_svc.MIN_PERIODS and me >= ms
 can_run = (
     bool(S.ts_boundary) and Path(S.ts_boundary).exists()
-    and not S.ts_running and valid_period
+    and not running and valid_period
 )
 if not valid_period:
-    status_banner("warning", "时间序列不足", "至少需要 3 个有效时相，且结束时间不得早于开始时间。")
+    status_banner("warning", "时间序列不足",
+                  f"至少需要 {ts_svc.MIN_PERIODS} 个时相（每个像元至少 {ts_svc.MIN_PERIODS} 期有效观测"
+                  "才做趋势检验），且结束时间不得早于开始时间。")
 btn = st.button(
     f"运行 {idx_type} 趋势分析 · {len(years)} 期",
     type="primary", icon=":material/play_arrow:",
-    use_container_width=True, disabled=not can_run)
+    width="stretch", disabled=not can_run)
 if btn and S.ts_boundary:
-    boundary = load_gj(S.ts_boundary)[1]
-    _run_timeseries(boundary, years, idx_type, data_src, ms, me)
+    _submit_timeseries(years, idx_type, data_src, ms, me)
+jobs_ui.progress(JOB_TS)
 
 # =====================================================================
 #  结果显示
@@ -414,7 +331,7 @@ if S.ts_result:
                 s_small = slope_valid[::scale_m, ::scale_m] if scale_m > 1 else slope_valid
                 vmax = max(abs(np.nanpercentile(s_small, 95)), 0.001)
                 im1 = axes_m[1].imshow(s_small, cmap="RdYlGn", vmin=-vmax, vmax=vmax)
-                axes_m[1].set_title(f"Sen's slope (仅显著区域 p<0.05)", fontsize=14, color="#18221D")
+                axes_m[1].set_title("Sen's slope (仅显著区域 p<0.05)", fontsize=14, color="#18221D")
                 axes_m[1].axis("off")
                 plt.colorbar(im1, ax=axes_m[1], shrink=0.5, label=f"{idx_type}/年")
 
@@ -443,11 +360,7 @@ if S.ts_result:
                 yr_rows.append({"年份": y, f"{idx_type} 均值": f"{summary['yearly_mean_index'].get(y, 0):.4f}"})
             if yr_rows:
                 section_header(f"各年 {idx_type} 均值")
-                st.dataframe(pd.DataFrame(yr_rows), use_container_width=True)
+                st.dataframe(pd.DataFrame(yr_rows))
 
-elif S.ts_running:
-    status_banner("info", "分析正在进行", "正在收集时相并计算趋势。")
-elif S.ts_error:
-    status_banner("danger", "分析失败", str(S.ts_error))
-else:
+elif not running:
     empty_state("暂无趋势结果", "确认侧栏参数并运行分析后显示。", "TS")

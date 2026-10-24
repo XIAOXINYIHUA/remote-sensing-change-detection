@@ -22,8 +22,9 @@ import streamlit as st
 if _base not in sys.path:
     sys.path.insert(0, _base)
 
-from frontend.utils import inject_global_css, setup_matplotlib_font, DATA_SOURCE_LABELS
-from frontend.project_state import ProjectState, migrate_from_legacy
+from frontend.utils import inject_global_css, setup_matplotlib_font, state_dir, DATA_SOURCE_LABELS
+from frontend.project_state import ProjectState
+from frontend.components.jobs import get_runner
 
 setup_matplotlib_font()
 
@@ -39,8 +40,7 @@ st.set_page_config(
 
 inject_global_css()
 
-ProjectState.init(project_dir=_base)
-migrate_from_legacy(st.session_state)
+ProjectState.init(project_dir=str(state_dir()))
 ps = ProjectState.get()
 
 with st.sidebar:
@@ -105,5 +105,9 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
     st.caption(f"本地工作区 · {len(ps.task_history)} 次分析")
+    # 首次调用时创建任务执行器：上次关闭时未结束的任务记为「已中断」
+    n_active = sum(job.active for job in get_runner().list(limit=50))
+    if n_active:
+        st.caption(f"后台任务 · {n_active} 个进行中，见任务中心")
 
 pg.run()

@@ -12,12 +12,14 @@ import folium
 import streamlit as st
 from streamlit_folium import st_folium
 
+from engine.utils import geodesic_area_km2
 from frontend.components.ui import (
     empty_state,
     page_header,
     section_header,
     task_row_heading,
 )
+from frontend.inventory import imagery_summary
 from frontend.project_state import ProjectState
 from frontend.utils import DATA_SOURCE_LABELS, load_gj, setup_matplotlib_font
 
@@ -31,18 +33,9 @@ def _project_area_km2() -> float | None:
         return None
     try:
         _, geom = load_gj(ps.boundary)
-        return geom.area * (111.32 ** 2)
+        return geodesic_area_km2(geom)
     except Exception:
         return None
-
-
-def _cache_summary() -> tuple[int, float]:
-    cache_roots = [Path(_base) / "data" / "cache", Path(_base) / "data"]
-    root = next((path for path in cache_roots if path.exists()), None)
-    if root is None:
-        return 0, 0.0
-    files = list(root.rglob("*.tif"))
-    return len(files), sum(path.stat().st_size for path in files) / 1024 / 1024
 
 
 def _open_analysis(page: str) -> None:
@@ -50,7 +43,7 @@ def _open_analysis(page: str) -> None:
 
 
 area_km2 = _project_area_km2()
-cache_count, cache_mb = _cache_summary()
+imagery = imagery_summary(Path(_base) / "data")
 history = list(ps.task_history)
 success_count = sum(1 for task in history if task.get("status") == "success")
 success_rate = success_count / len(history) * 100 if history else 0
@@ -70,9 +63,18 @@ page_header(
 
 metric_cols = st.columns(4)
 metric_cols[0].metric("分析范围", f"{area_km2:,.0f} km²" if area_km2 is not None else "--")
-metric_cols[1].metric(f"本地影像 · {cache_count} 个文件", f"{cache_mb:,.0f} MB")
+metric_cols[1].metric(
+    f"可复用影像 · {imagery['reusable_sets']} 组",
+    f"{imagery['reusable_mb']:,.0f} MB",
+    help=f"缓存时相 {imagery['snapshots']} 期（各分析共用）· 旧版地物分类下载 {imagery['classify_sets']} 组",
+)
 metric_cols[2].metric(f"分析任务 · {success_count} 个成功", len(history))
 metric_cols[3].metric("任务成功率", f"{success_rate:.0f}%" if history else "--")
+if imagery["stale_files"]:
+    st.caption(
+        f"另有 {imagery['stale_files']} 个旧版下载或过期缓存的影像文件"
+        f"（{imagery['stale_mb']:,.0f} MB）不会被分析复用，详见「系统与数据」。"
+    )
 
 if ps.is_ready():
     section_header("当前分析区域", "边界预览与常用分析入口", "项目")
@@ -115,23 +117,23 @@ if ps.is_ready():
         with left:
             if st.button(
                 "变化检测", icon=":material/compare:",
-                use_container_width=True, key="home_change",
+                width="stretch", key="home_change",
             ):
                 _open_analysis("pages/01_变化检测.py")
             if st.button(
                 "时间序列", icon=":material/show_chart:",
-                use_container_width=True, key="home_timeseries",
+                width="stretch", key="home_timeseries",
             ):
                 _open_analysis("pages/03_时间序列.py")
         with right:
             if st.button(
                 "地物分类", icon=":material/category:",
-                use_container_width=True, key="home_classify",
+                width="stretch", key="home_classify",
             ):
                 _open_analysis("pages/02_地物分类.py")
             if st.button(
                 "批量任务", icon=":material/layers:",
-                use_container_width=True, key="home_batch",
+                width="stretch", key="home_batch",
             ):
                 _open_analysis("pages/04_批量处理.py")
 
@@ -140,7 +142,7 @@ if ps.is_ready():
             "新建分析配置",
             type="primary",
             icon=":material/add:",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state.wizard_step = 0
             st.session_state.wizard_complete = False
@@ -170,7 +172,7 @@ else:
             "设置分析区域",
             type="primary",
             icon=":material/add_location_alt:",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state.wizard_step = 0
             st.session_state.wizard_complete = False
@@ -226,13 +228,13 @@ if history:
             with open_col:
                 if st.button(
                     "打开", icon=":material/open_in_new:",
-                    key=f"open_{task_id}", use_container_width=True,
+                    key=f"open_{task_id}", width="stretch",
                 ):
                     st.switch_page(target_pages.get(mode, "pages/01_变化检测.py"))
             with delete_col:
                 if st.button(
                     "删除", icon=":material/delete:",
-                    key=f"del_{task_id}", use_container_width=True,
+                    key=f"del_{task_id}", width="stretch",
                 ):
                     ps.task_history = [item for item in ps.task_history if item.get("id") != task_id]
                     ProjectState.commit()

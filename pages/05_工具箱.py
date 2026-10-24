@@ -1,6 +1,5 @@
 """System, storage and runtime information."""
 
-import os
 import platform
 import shutil
 import sys
@@ -14,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from frontend.components.ui import empty_state, page_header, section_header, status_banner
+from frontend.inventory import imagery_summary
 from frontend.utils import setup_matplotlib_font
 
 setup_matplotlib_font()
@@ -31,7 +31,7 @@ for name in ["data", "output", "tmp", "models", "reports"]:
     count, size_mb = _dir_summary(_base / name)
     storage_rows.append({"目录": name, "文件数": count, "占用": f"{size_mb:,.1f} MB"})
 
-data_files, data_mb = _dir_summary(_base / "data")
+imagery = imagery_summary(_base / "data")
 output_files, output_mb = _dir_summary(_base / "output")
 tmp_files, tmp_mb = _dir_summary(_base / "tmp")
 disk = shutil.disk_usage(_base)
@@ -50,7 +50,11 @@ page_header(
 )
 
 metrics = st.columns(4)
-metrics[0].metric(f"影像数据 · {data_files} 个文件", f"{data_mb:,.0f} MB")
+metrics[0].metric(
+    f"可复用影像 · {imagery['reusable_sets']} 组",
+    f"{imagery['reusable_mb']:,.0f} MB",
+    help=f"缓存时相 {imagery['snapshots']} 期（各分析共用）· 旧版地物分类下载 {imagery['classify_sets']} 组",
+)
 metrics[1].metric(f"分析成果 · {output_files} 个文件", f"{output_mb:,.0f} MB")
 metrics[2].metric(f"临时文件 · {tmp_files} 个文件", f"{tmp_mb:,.0f} MB")
 metrics[3].metric("磁盘可用", f"{disk.free / 1024**3:,.1f} GB")
@@ -59,7 +63,14 @@ tab_storage, tab_runtime, tab_capability = st.tabs(["存储概览", "运行环�
 
 with tab_storage:
     section_header("目录占用", "项目工作目录的文件数量与磁盘占用。", "本地")
-    st.dataframe(pd.DataFrame(storage_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(storage_rows), hide_index=True)
+    if imagery["stale_files"]:
+        status_banner(
+            "warning",
+            f"{imagery['stale_files']} 个影像文件不会被分析复用（{imagery['stale_mb']:,.0f} MB）",
+            "data 目录中的旧版下载缺少质量波段，或缓存的预处理版本已过期；"
+            "分析会重新下载。确认不再需要后可手动删除以释放空间。",
+        )
 
     section_header("最近成果", "output 目录中最近生成的文件。")
     output_root = _base / "output"
@@ -78,7 +89,7 @@ with tab_storage:
             }
             for path in recent_outputs
         ]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
     else:
         empty_state("暂无成果文件", "完成分析后会写入 output 目录。", "OUT")
 
@@ -105,7 +116,7 @@ with tab_runtime:
             rows.append({"依赖": package, "版本": version, "状态": "可用"})
         except ImportError:
             rows.append({"依赖": package, "版本": "--", "状态": "缺失"})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), hide_index=True)
 
 with tab_capability:
     section_header("模块能力", "当前版本中各业务模块的可用状态。", "能力")
@@ -118,4 +129,4 @@ with tab_capability:
         {"模块": "时间序列", "状态": "可用", "范围": "Mann-Kendall 与 Sen's slope"},
         {"模块": "PDF 报告", "状态": "可用", "范围": "分析结果自动汇编"},
     ]
-    st.dataframe(pd.DataFrame(capabilities), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(capabilities), hide_index=True)

@@ -9,12 +9,10 @@
   - 指数-波段需求映射
 """
 
-import os
 import sys
 import json
 import warnings
 
-import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -143,6 +141,27 @@ def boundary_pixel_mask(boundary_wgs84, meta, height, width):
         out_shape=(height, width),
     )
     return mask_arr
+
+
+def geodesic_area_km2(geom_wgs84):
+    """WGS84 几何在椭球面上的真实面积 (km²)，支持多面与内环。
+
+    不能用「度² × 111.32²」：经度方向 1° 的长度随 cos(纬度) 缩短，
+    该近似在 25°N 就会高估约 11%。
+    """
+    from pyproj import Geod
+
+    geod = Geod(ellps="WGS84")
+    polygons = getattr(geom_wgs84, "geoms", [geom_wgs84])
+    total = 0.0
+    for poly in polygons:
+        if poly.geom_type != "Polygon":
+            total += geodesic_area_km2(poly) * 1e6 if hasattr(poly, "geoms") else 0.0
+            continue
+        total += abs(geod.polygon_area_perimeter(*poly.exterior.xy)[0])
+        total -= sum(abs(geod.polygon_area_perimeter(*ring.xy)[0])
+                     for ring in poly.interiors)
+    return total / 1e6
 
 
 # ============================================================================

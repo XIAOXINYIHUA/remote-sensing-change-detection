@@ -14,8 +14,6 @@
 依赖: numpy, scipy, sklearn（已有）
 """
 
-import os
-import time
 import numpy as np
 from scipy.ndimage import uniform_filter, sobel
 
@@ -182,20 +180,6 @@ def extract_texture(band, window_size=3):
     }
 
 
-def extract_all_textures(bands):
-    """从所有可用波段提取纹理特征并拼接。
-
-    返回:
-        np.ndarray: (H, W, 2 * N_bands) 纹理特征张量
-    """
-    texture_stack = []
-    for bname, arr in bands.items():
-        tex = extract_texture(arr)
-        texture_stack.append(tex["variance"])
-        texture_stack.append(tex["edge_density"])
-    return np.stack(texture_stack, axis=-1)
-
-
 # ============================================================================
 #  特征堆叠：10 波段 + 6 指数 + 纹理
 # ============================================================================
@@ -284,7 +268,6 @@ def pca_gmm_classify(feature_stack, n_clusters=6, sample_ratio=0.05,
 
     h, w, c = feature_stack.shape
     pixels = feature_stack.reshape(-1, c)  # (N, C)
-    n_pixels = pixels.shape[0]
 
     # 剔除无效像元 (全 0 行) 避免干扰标准化
     valid_rows = ~(np.max(np.abs(pixels), axis=1) == 0)
@@ -296,6 +279,7 @@ def pca_gmm_classify(feature_stack, n_clusters=6, sample_ratio=0.05,
 
     # 随机采样用于 PCA 拟合
     n_sample = max(1000, min(int(pixels_scaled.shape[0] * sample_ratio), 50000))
+    n_sample = min(n_sample, pixels_scaled.shape[0])
     rng = np.random.RandomState(random_state)
     sample_idx = rng.choice(pixels_scaled.shape[0], n_sample, replace=False)
     sample_data = pixels_scaled[sample_idx]
@@ -309,7 +293,8 @@ def pca_gmm_classify(feature_stack, n_clusters=6, sample_ratio=0.05,
     pixels_all_scaled = scaler.transform(pixels)
     pca_all = pca.transform(pixels_all_scaled).reshape(h, w, pca_dims)
 
-    # 用降维后的数据做 GMM
+    # 用降维后的数据做 GMM：只在有效像元的采样上拟合（大影像全图拟合
+    # 既慢又占内存，且无效像元会被当成一个光谱簇），再预测全图
     pca_flat = pca_all.reshape(-1, pca_dims)
 
     gmm = GaussianMixture(
@@ -319,7 +304,7 @@ def pca_gmm_classify(feature_stack, n_clusters=6, sample_ratio=0.05,
         max_iter=200,
         n_init=3,
     )
-    gmm.fit(pca_flat)
+    gmm.fit(pca.transform(sample_data))
 
     labels = gmm.predict(pca_flat).reshape(h, w)
     probs = gmm.predict_proba(pca_flat).reshape(h, w, n_clusters)
@@ -373,12 +358,10 @@ def uncertainty_sampling(pca_3d, gmm, n_samples=200):
         indices: (n, 2) array of (row, col) 最不确定像元的坐标
         uncertainties: (n,) 不确定度分数（越高越不确定）
     """
-    h, w, _ = pca_3d.shape
-    pca_flat = pca_3d.reshape(-1, 3)
+    h, w, n_dims = pca_3d.shape
+    pca_flat = pca_3d.reshape(-1, n_dims)
     probs = gmm.predict_proba(pca_flat)
 
-    # 策略 1: 最大概率置信度（越低越不确定）
-    confidence = probs.max(axis=1)  # (N,)
     entropy = -np.sum(probs * np.log(probs + 1e-10), axis=1)  # (N,)
 
     # 不确定性分数 = 熵（归一化）
@@ -400,36 +383,29 @@ def sample_patches(bands, pca_3d, gmm, patch_size=32, n_patches=50):
         uncertainties: 每个斑块的平均不确定性
     """
     h, w = list(bands.values())[0].shape[:2]
-    _, uncertainties = uncertainty_sampling(pca_3d, gmm, n_samples=n_patches * 10)
+    # coords 是全图 (row, col)，已按不确定性降序排列；
+    # 候选数按斑块面积放大，高不确定区域集中时仍能凑够不重叠斑块
+    coords, uncertainties = uncertainty_sampling(
+        pca_3d, gmm, n_samples=min(n_patches * patch_size * patch_size, h * w))
 
-    # 把不确定性分数映射回网格
-    uncertainty_map = np.zeros((h, w), dtype=np.float32)
-    rows, cols = np.unravel_index(
-        np.argsort(-uncertainties.flatten())[:n_patches * 10],
-        (h, w),
-    )
-    uncertainty_map[rows, cols] = uncertainties[: len(rows)]
-
-    # 在不确定性高的区域采样不重叠斑块
+    # 在不确定性高的像元处采样不重叠斑块
     half = patch_size // 2
-    patches = []
+    patches, patch_unc = [], []
     used = np.zeros((h, w), dtype=bool)
 
-    # 按不确定性排序的像元
-    candidates = np.argsort(-uncertainty_map.flatten())
-    for idx in candidates:
-        r = idx // w
-        c = idx % w
+    for (r, c), u in zip(coords, uncertainties):
+        r, c = int(r), int(c)
         if r - half < 0 or r + half >= h or c - half < 0 or c + half >= w:
             continue
         if used[r - half : r + half + 1, c - half : c + half + 1].any():
             continue
         patches.append((r, c))
+        patch_unc.append(float(u))
         used[r - half : r + half + 1, c - half : c + half + 1] = True
         if len(patches) >= n_patches:
             break
 
-    return patches, [float(uncertainty_map[r, c]) for r, c in patches]
+    return patches, patch_unc
 
 
 # ============================================================================

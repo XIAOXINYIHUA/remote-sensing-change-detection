@@ -1,42 +1,33 @@
 """
-ProjectState — 统一项目/AOI 状态管理
+ProjectState — 项目状态：一个项目一个状态文件（状态目录下的 .project_state.json）
 
-所有页面通过此模块读取/写入共享的 AOI 和项目设置。
-每个页面仍有自己的私有状态 (cd_*, cl_*, ts_*, bt_*)。
+文件内容:
+    区域（region / boundary / slug）、数据源、指数、时相、云量等项目设置
+    task_history   分析记录
+    pages          各页需要跨会话保留的状态，按页面前缀分节（cd / cl / ts / bt），
+                   每节记下所属区域 aoi；区域换了，旧区域的页面状态不再载入
+
+分析区域只有一个，以项目为准：任何页面（侧栏、向导）切换区域都写到这里，
+各页每次运行从项目同步区域，发现区域变了就清掉本页属于旧区域的数据。
 
 用法:
     from frontend.project_state import ProjectState
     ps = ProjectState.get()
     ps.region = "新余市"
-    ps.boundary = "新余.geojson"
-    ps.commit()
+    ProjectState.commit()
+
+    ProjectState.save_page("cd", {"cd_data_ok": True})
+    ProjectState.load_page("cd", ["cd_data_ok"])     # 区域没变时返回已保存的值
+
+同一状态目录被多个会话（浏览器标签页）共用：get() 发现文件被别的会话改过就重新载入。
+旧版的 .shared_state.json 与各页状态文件（.app_state.json 等）在首次启动时并入新文件，
+旧文件不再读写，可以删除。
 """
 
 from __future__ import annotations
 import dataclasses
 import json
 import os
-from pathlib import Path
-from typing import Optional
-
-
-@dataclasses.dataclass
-class TaskRecord:
-    """单次分析任务的记录。"""
-    id: str = ""
-    mode: str = ""            # "change_detection" | "classification" | "timeseries"
-    region: str = ""
-    data_source: str = ""
-    index_type: str = ""
-    year1: int = 0
-    year2: int = 0
-    status: str = "pending"   # pending | running | success | failed
-    started_at: str = ""
-    finished_at: str = ""
-    duration_s: float = 0.0
-    stats_summary: str = ""   # 简短摘要（如"变化 123 ha"）
-    output_files: dict = dataclasses.field(default_factory=dict)
-    error: str = ""
 
 
 @dataclasses.dataclass
@@ -66,12 +57,16 @@ class _ProjectState:
     scenes_year1: list = dataclasses.field(default_factory=list)
     scenes_year2: list = dataclasses.field(default_factory=list)
 
+    # 各页状态：{页面前缀: {"aoi": 所属边界, 会话键: 值, ...}}
+    pages: dict = dataclasses.field(default_factory=dict)
+
     def is_ready(self) -> bool:
         """检查是否有可用的边界和地区。"""
         return bool(self.boundary) and bool(self.region) and os.path.exists(self.boundary)
 
     def to_dict(self) -> dict:
         return {
+            "version": STATE_VERSION,
             "region": self.region,
             "boundary": self.boundary,
             "slug": self.slug,
@@ -85,6 +80,7 @@ class _ProjectState:
             "last_analysis_mode": self.last_analysis_mode,
             "last_analysis_time": self.last_analysis_time,
             "task_history": self.task_history,
+            "pages": self.pages,
         }
 
     @classmethod
@@ -103,8 +99,20 @@ class _ProjectState:
             last_analysis_mode=d.get("last_analysis_mode", ""),
             last_analysis_time=d.get("last_analysis_time", ""),
             task_history=d.get("task_history", []),
+            pages=d.get("pages") or {},
         )
 
+
+STATE_VERSION = 2
+STATE_FILE_NAME = ".project_state.json"
+LEGACY_SHARED_FILE = ".shared_state.json"
+# 旧版各页状态文件 → 页面前缀
+LEGACY_PAGE_FILES = {
+    ".app_state.json": "cd",
+    ".classify_state.json": "cl",
+    ".ts_state.json": "ts",
+    ".batch_state.json": "bt",
+}
 
 _PROJECT_STATE_FILE = ""
 
@@ -118,24 +126,30 @@ class ProjectState:
     """
 
     _ST_KEY = "_shared_project_state"
+    _STAMP_KEY = "_shared_project_state_stamp"     # 本会话最后一次读 / 写时文件的（修改时间, 大小）
 
     @classmethod
     def init(cls, project_dir: str = ""):
-        """初始化 ProjectState 模块（在 app.py 启动时调用一次）。"""
+        """设置状态文件位置（app.py 每次运行时调用）；新文件不存在时并入旧版状态文件。"""
         global _PROJECT_STATE_FILE
-        if project_dir:
-            _PROJECT_STATE_FILE = os.path.join(project_dir, ".shared_state.json")
-        else:
-            _PROJECT_STATE_FILE = ".shared_state.json"
+        _PROJECT_STATE_FILE = os.path.join(project_dir or ".", STATE_FILE_NAME)
+        if not os.path.exists(_PROJECT_STATE_FILE):
+            _migrate_legacy_files(project_dir or ".", _PROJECT_STATE_FILE)
 
     @classmethod
     def get(cls):
-        """获取当前 session 的共享项目状态（懒加载）。"""
+        """当前会话的项目状态（首次调用时从文件载入；文件被别的会话改过时重新载入）。"""
         import streamlit as st
         if cls._ST_KEY not in st.session_state:
             st.session_state[cls._ST_KEY] = _ProjectState()
-            # 尝试从文件加载
             cls._load_from_file()
+        else:
+            stamp = _file_stamp()
+            seen = st.session_state.get(cls._STAMP_KEY)
+            if seen is None:
+                st.session_state[cls._STAMP_KEY] = stamp
+            elif stamp is not None and stamp != seen:
+                cls._load_from_file()
         return st.session_state[cls._ST_KEY]
 
     @classmethod
@@ -159,7 +173,6 @@ class ProjectState:
     @classmethod
     def _save_to_file(cls, ps: _ProjectState):
         """原子写入：先写 .tmp 再 rename，避免并发读取到不完整状态。"""
-        global _PROJECT_STATE_FILE
         if not _PROJECT_STATE_FILE:
             return
         try:
@@ -167,22 +180,57 @@ class ProjectState:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(ps.to_dict(), f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, _PROJECT_STATE_FILE)  # 原子替换
+            import streamlit as st
+            st.session_state[cls._STAMP_KEY] = _file_stamp()
         except Exception:
             pass
 
     @classmethod
     def _load_from_file(cls):
-        global _PROJECT_STATE_FILE
+        """从文件载入，原地更新会话中的对象（页面已持有的 ps 引用仍然有效）。"""
         import streamlit as st
-        if not _PROJECT_STATE_FILE or not os.path.exists(_PROJECT_STATE_FILE):
+        stamp = _file_stamp()
+        st.session_state[cls._STAMP_KEY] = stamp
+        if stamp is None:
             return
-        try:
-            with open(_PROJECT_STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            ps = _ProjectState.from_dict(data)
-            st.session_state[cls._ST_KEY] = ps
-        except Exception:
-            pass
+        data = _read_json(_PROJECT_STATE_FILE)
+        if isinstance(data, dict):
+            loaded = _ProjectState.from_dict(data)
+            st.session_state[cls._ST_KEY].__dict__.update(loaded.__dict__)
+
+    # ---- 页面状态 ----
+
+    @classmethod
+    def load_page(cls, prefix: str, keys, aoi_bound: bool = True) -> dict:
+        """页面保存在项目状态里的值（keys 中非 None 的）。
+
+        aoi_bound: 该页状态属于某个分析区域，保存时的区域与当前项目区域不同则返回空。
+        """
+        ps = cls.get()
+        section = ps.pages.get(prefix) or {}
+        if aoi_bound and not same_path(section.get("aoi"), ps.boundary):
+            return {}
+        return {k: section[k] for k in keys if section.get(k) is not None}
+
+    @classmethod
+    def save_page(cls, prefix: str, values: dict):
+        """保存页面状态（整节替换），记下所属区域。"""
+        ps = cls.get()
+        ps.pages[prefix] = {**values, "aoi": ps.boundary}
+        cls.commit()
+
+    @classmethod
+    def aoi_changed(cls, prefix: str) -> bool:
+        """本会话中该页数据所属的区域与当前项目区域不同（随后记下当前区域）。
+
+        首次进入该页时为 False：已保存的页面状态由 load_page 按区域筛选。
+        """
+        import streamlit as st
+        key = f"_{prefix}_aoi"
+        current = cls.get().boundary
+        previous = st.session_state.get(key)
+        st.session_state[key] = current
+        return previous is not None and not same_path(previous, current)
 
     @classmethod
     def add_task(cls, record: dict):
@@ -202,7 +250,6 @@ class ProjectState:
         import streamlit as st
         if cls._ST_KEY in st.session_state:
             del st.session_state[cls._ST_KEY]
-        global _PROJECT_STATE_FILE
         if _PROJECT_STATE_FILE and os.path.exists(_PROJECT_STATE_FILE):
             try:
                 os.remove(_PROJECT_STATE_FILE)
@@ -214,46 +261,6 @@ class ProjectState:
 #  任务历史 UI
 # ============================================================================
 
-def render_task_history(max_items: int = 10):
-    """在侧边栏或页面中渲染任务历史（只读，不写入任何文件）。"""
-    import streamlit as st
-    ps = ProjectState.get()
-    history = list(ps.task_history[-max_items:])[::-1]  # 最新的在前
-
-    if not history:
-        st.caption("暂无分析历史")
-        return
-
-    for task in history:
-        mode_icon = {
-            "change_detection": "🛰️",
-            "classification": "🗺️",
-            "timeseries": "📈",
-        }.get(task.get("mode", ""), "📋")
-        status_icon = {
-            "success": "✅",
-            "failed": "❌",
-            "running": "⏳",
-            "pending": "⏸️",
-        }.get(task.get("status", ""), "❓")
-
-        label = (
-            f"{status_icon} {mode_icon} "
-            f"{task.get('region', '?')} "
-            f"{task.get('index_type', '')} "
-            f"{task.get('year1', '')}→{task.get('year2', '')}"
-        )
-        summary = task.get("stats_summary", "")
-        t_id = task.get("id", "")
-        duration = task.get("duration_s", 0)
-
-        # 可点击的卡片（未来可跳转结果页）
-        card_label = f"{status_icon} **{task.get('region', '?')}**  {task.get('index_type', '')}  {task.get('year1', '')}→{task.get('year2', '')}  ({duration:.0f}s)"
-        if summary:
-            card_label += f"  — {summary}"
-        with st.container():
-            st.caption(card_label)
-
 
 def _make_slug(name: str) -> str:
     """将名称转为文件系统友好的短标识。"""
@@ -262,34 +269,71 @@ def _make_slug(name: str) -> str:
     return slug_str.strip("_")[:30] or "default"
 
 
-def migrate_from_legacy(session_state) -> bool:
-    """从页面各自的 cd_* / cl_* / ts_* 状态迁移到共享 ProjectState。
+def same_path(a, b) -> bool:
+    """两个边界路径是否指同一文件（都为空也算相同）。"""
+    if not a or not b:
+        return not a and not b
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
-    如果发现 cd_boundary 已存在且 ProjectState 为空，则迁移。
+
+def _file_stamp():
+    """状态文件的（修改时间 ns, 大小）；用来发现别的会话写过文件。"""
+    if not _PROJECT_STATE_FILE:
+        return None
+    try:
+        st = os.stat(_PROJECT_STATE_FILE)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _migrate_legacy_files(state_dir: str, target: str) -> bool:
+    """把旧版 .shared_state.json 与各页状态文件并入 target（旧文件保留不动）。
+
+    旧版各页文件的键有两种写法：cd_data_ok（带页面前缀）与 download_ok（更早的版本，无前缀），
+    统一成带前缀的会话键；其中的边界作为该节的 aoi，与项目区域不同的页面状态之后不会载入。
 
     Returns:
-        bool: 是否发生了迁移
+        是否写出了新文件（没有任何旧文件时不写）。
     """
-    ps = ProjectState.get()
-    if ps.is_ready():
-        return False  # 已有共享状态
+    shared = _read_json(os.path.join(state_dir, LEGACY_SHARED_FILE))
+    pages = {}
+    for name, prefix in LEGACY_PAGE_FILES.items():
+        data = _read_json(os.path.join(state_dir, name))
+        if not isinstance(data, dict):
+            continue
+        data = {k if k.startswith(f"{prefix}_") else f"{prefix}_{k}": v for k, v in data.items()}
+        aoi_keys = (f"{prefix}_boundary", f"{prefix}_region", f"{prefix}_slug")
+        pages[prefix] = {k: v for k, v in data.items() if k not in aoi_keys}
+        pages[prefix]["aoi"] = data.get(f"{prefix}_boundary") or ""
+    if not isinstance(shared, dict) and not pages:
+        return False
 
-    migrated = False
-    legacy_keys = [
-        ("cd_boundary", "cd_region", "cd_slug"),
-        ("cl_boundary", "cl_region", "cl_slug"),
-        ("ts_boundary", "ts_region", "ts_slug"),
-    ]
-    for bkey, rkey, skey in legacy_keys:
-        boundary = session_state.get(bkey)
-        region = session_state.get(rkey)
-        if boundary and region:
-            ps.region = region
-            ps.boundary = boundary
-            ps.slug = session_state.get(skey, _make_slug(region))
-            migrated = True
-            break
-
-    if migrated:
-        ProjectState.commit()
-    return migrated
+    state = _ProjectState.from_dict(shared if isinstance(shared, dict) else {})
+    state.pages = pages
+    if not state.boundary:
+        # 旧版共享状态没有区域：沿用最近使用的页面区域（变化检测优先）
+        for name, prefix in LEGACY_PAGE_FILES.items():
+            data = _read_json(os.path.join(state_dir, name)) or {}
+            boundary = data.get(f"{prefix}_boundary") or data.get("boundary")
+            region = data.get(f"{prefix}_region") or data.get("region")
+            if boundary and region:
+                state.region, state.boundary = region, boundary
+                state.slug = data.get(f"{prefix}_slug") or data.get("slug") or _make_slug(region)
+                break
+    try:
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, target)
+        return True
+    except Exception:
+        return False

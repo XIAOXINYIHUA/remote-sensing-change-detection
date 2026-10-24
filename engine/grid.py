@@ -14,12 +14,12 @@ import dataclasses
 import typing as T
 
 import numpy as np
+from numpy.typing import NDArray
 import rasterio
 from rasterio import warp
 from rasterio.crs import CRS
 from rasterio.transform import Affine
 from pyproj import Transformer
-from shapely.geometry import box, shape
 from shapely.ops import transform as shp_transform
 
 
@@ -123,8 +123,6 @@ def reproject_to_grid(
     Returns:
         NDArray: (H, W) 对齐后的数组
     """
-    from engine.utils import log as _log
-
     need_close = False
     if isinstance(source, str):
         src = rasterio.open(source)
@@ -158,28 +156,6 @@ def reproject_to_grid(
     finally:
         if need_close:
             src.close()
-
-
-def reproject_bands(
-    band_dict: dict[str, NDArray | str | tuple],
-    target_grid: GridSpec,
-    resampling: int = warp.Resampling.bilinear,
-) -> dict[str, NDArray]:
-    """将波段字典全部配准到目标网格。
-
-    Args:
-        band_dict: {band_name: array} 或 {band_name: (array, meta)}
-                   或 {band_name: file_path}
-        target_grid: 目标网格
-        resampling: 插值方法
-
-    Returns:
-        {band_name: NDArray(H, W)} 全部对齐
-    """
-    aligned = {}
-    for name, src in band_dict.items():
-        aligned[name] = reproject_to_grid(src, target_grid, resampling)
-    return aligned
 
 
 # ============================================================================
@@ -252,7 +228,6 @@ def boundary_grid_crop(
     Returns:
         GridSpec: 刚好覆盖 AOI 的网格
     """
-    from rasterio.warp import transform_bounds
     t = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
     bnd_proj = shp_transform(lambda x, y: t.transform(x, y), boundary_wgs84)
     minx, miny, maxx, maxy = bnd_proj.bounds
@@ -276,65 +251,50 @@ def boundary_grid_crop(
     )
 
 
-def compute_pixel_area_ha(crs: CRS, lat: float | None = None) -> float:
-    """估算像元面积（公顷），处理经纬度坐标系。
+def utm_crs_for(boundary_wgs84) -> CRS:
+    """返回 AOI 质心所在的 UTM 带 (WGS84 / UTM)。"""
+    c = boundary_wgs84.centroid
+    zone = min(60, max(1, int((c.x + 180) // 6) + 1))
+    return CRS.from_epsg((32600 if c.y >= 0 else 32700) + zone)
+
+
+def aoi_grid(
+    boundary_wgs84,
+    resolution: float,
+    origin_offset: float = 0.0,
+    crs: CRS | None = None,
+    pad_pixels: int = 2,
+) -> GridSpec:
+    """由 AOI 确定的统一分析网格。
+
+    同一 AOI + 分辨率总是得到完全相同的网格（与选中的瓦片无关），
+    因此不同年份、不同波段无需再次重投影即可逐像元比较。
+    网格角点吸附到 origin_offset + k*resolution，与传感器原生像元格网对齐
+    （Sentinel-2: 0，Landsat C2: 15 m），同带瓦片读取时不做插值。
 
     Args:
-        crs: 坐标参考系
-        lat: 纬度（仅 WGS84 需要）
-
-    Returns:
-        单像元公顷数
+        boundary_wgs84: WGS84 Shapely 几何
+        resolution: 像元大小 (m)
+        origin_offset: 格网原点偏移 (m)
+        crs: 目标投影，None=AOI 质心所在 UTM 带
+        pad_pixels: 边界外扩像元数
     """
-    if crs.is_geographic:
-        if lat is not None:
-            from math import cos, radians
-            scale = cos(radians(abs(lat)))
-            return (0.000277 * scale) ** 2 * 100 / 0.01  # ~1.07 ha at equator
-        return 1.07  # 粗略估计
-    else:
-        return 1.0  # 投影坐标系 1 m²
+    import math
+    crs = crs or utm_crs_for(boundary_wgs84)
+    t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    bnd_proj = shp_transform(lambda x, y: t.transform(x, y), boundary_wgs84)
+    minx, miny, maxx, maxy = bnd_proj.bounds
 
+    pad = pad_pixels * resolution
+    snap_down = lambda v: math.floor((v - origin_offset) / resolution) * resolution + origin_offset
+    snap_up = lambda v: math.ceil((v - origin_offset) / resolution) * resolution + origin_offset
+    minx, miny = snap_down(minx - pad), snap_down(miny - pad)
+    maxx, maxy = snap_up(maxx + pad), snap_up(maxy + pad)
 
-# ============================================================================
-#  便捷函数：从边界+时相创建完整分析网格
-# ============================================================================
-
-def ensure_consistent_grid(bands_dicts: list[dict]) -> GridSpec:
-    """从多个波段字典中确保网格一致并返回参考网格。
-
-    Args:
-        bands_dicts: [{band_name: file_path}, ...] 每期影像
-
-    Returns:
-        统一的 GridSpec
-
-    Raises:
-        ValueError: 无有效数据
-        RuntimeError: 网格不一致且无法自动纠正
-    """
-    ref_grid: GridSpec | None = None
-    for bd in bands_dicts:
-        for bname, fpath in bd.items():
-            if not isinstance(fpath, str):
-                continue
-            if not fpath.endswith(".tif") or not os.path.exists(fpath):
-                continue
-            try:
-                with rasterio.open(fpath) as src:
-                    gs = GridSpec.from_src(src)
-                    if ref_grid is None:
-                        ref_grid = gs
-                    else:
-                        assert_grid_consistent([ref_grid, gs], [str(ref_grid), f"{bname}@{fpath}"])
-            except (rasterio.errors.RasterioIOError, ValueError):
-                continue
-
-    if ref_grid is None:
-        raise ValueError("No valid raster found to determine grid")
-    return ref_grid
-
-
-# 模块级日志函数
-import os
-from engine.utils import log as _log
+    return GridSpec(
+        crs=crs,
+        transform=Affine(resolution, 0.0, minx, 0.0, -resolution, maxy),
+        width=max(1, int(round((maxx - minx) / resolution))),
+        height=max(1, int(round((maxy - miny) / resolution))),
+        nodata=0.0,
+    )

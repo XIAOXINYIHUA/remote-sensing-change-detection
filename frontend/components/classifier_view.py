@@ -110,14 +110,11 @@ def _matplotlib_3d_scatter(x, y, z, labels, n_clusters):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
 
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
 
-    colors = plt.cm.tab10(np.linspace(0, 1, n_clusters))
-    scatter = ax.scatter(x, y, z, c=labels, cmap="tab10",
-                         s=1, alpha=0.6)
+    ax.scatter(x, y, z, c=labels, cmap="tab10", s=1, alpha=0.6)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
     ax.set_zlabel("PC3")
@@ -132,29 +129,6 @@ def _matplotlib_3d_scatter(x, y, z, labels, n_clusters):
     ax.tick_params(colors="#526159")
 
     return fig
-
-
-# ============================================================================
-#  聚类 → 颜色映射表
-# ============================================================================
-
-def get_cluster_colors(n_clusters):
-    """为每个聚类分配可视化颜色，返回 {cluster_id: hex_color}。"""
-    try:
-        from plotly.colors import qualitative
-        colors = qualitative.Plotly * (n_clusters // len(qualitative.Plotly) + 1)
-        return {i: colors[i] for i in range(n_clusters)}
-    except ImportError:
-        import matplotlib.pyplot as plt
-        cmap = plt.cm.tab10
-        return {
-            i: "#{:02x}{:02x}{:02x}".format(
-                int(cmap(i / max(n_clusters, 1))[0] * 255),
-                int(cmap(i / max(n_clusters, 1))[1] * 255),
-                int(cmap(i / max(n_clusters, 1))[2] * 255),
-            )
-            for i in range(n_clusters)
-        }
 
 
 # ============================================================================

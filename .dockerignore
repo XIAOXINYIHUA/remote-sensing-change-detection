@@ -1,0 +1,31 @@
+.git
+.github
+.pytest_cache
+.ruff_cache/
+**/__pycache__
+**/*.pyc
+
+# 运行时数据与产物（通过 volume 挂载）
+data/
+output/
+tmp/
+models/
+
+# 本地状态
+.project_state.json
+.batch_state.json
+.app_state.json
+.classify_state.json
+.shared_state.json
+.ts_state.json
+.streamlit/secrets.toml
+.claude/
+# 根目录下的本地边界文件（examples/ 里的示例区域照常打包）
+/*.geojson
+
+# 开发文件
+tests/
+docker/
+DEV_CONTEXT.md
+V3_UPGRADE_PLAN.md
+*.log
