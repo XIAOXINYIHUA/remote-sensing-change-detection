@@ -39,7 +39,7 @@ import traceback
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ACTIVE_STATES = ("queued", "running")
@@ -255,6 +255,7 @@ class JobRunner:
         self.mode = mode
         self.id = uuid.uuid4().hex
         self._lock = threading.RLock()
+        self._last_id_dt = None           # 保证任务 ID 时间戳严格递增（同毫秒会破坏 list() 顺序）
         self._queue = deque()
         self._running = {}              # job_id -> [worker, 取消请求时刻 | None]
         self._wake = threading.Event()
@@ -326,7 +327,13 @@ class JobRunner:
         target = KINDS.get(kind, kind)
         if ":" not in target:
             raise ValueError(f"未知任务类型 {kind}")
-        job_id = f"{datetime.now():%Y%m%d-%H%M%S-%f}"[:-3] + f"-{uuid.uuid4().hex[:4]}"
+        # 时间戳严格递增：同一毫秒内连续提交时 +1ms，确保目录名排序 = 提交顺序
+        with self._lock:
+            now = datetime.now()
+            if self._last_id_dt is not None and now <= self._last_id_dt:
+                now = self._last_id_dt + timedelta(milliseconds=1)
+            self._last_id_dt = now
+        job_id = f"{now:%Y%m%d-%H%M%S-%f}"[:-3] + f"-{uuid.uuid4().hex[:4]}"
         spec = {"id": job_id, "kind": kind, "target": target, "title": title or kind,
                 "params": params, "meta": meta or {}, "created_at": _now(), "runner": self.id}
         json.dumps(spec, ensure_ascii=False)      # 不可序列化时在建目录之前报错
